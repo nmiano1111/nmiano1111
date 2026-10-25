@@ -93,7 +93,7 @@ func FormatRunDetail(run *agent.Run) string {
 
 	badge, style := statusBadge(run.Status)
 	sb.WriteString("\n")
-	sb.WriteString(StyleHeader.Render("Run") + "  " + StyleRunID.Render(shortID(run.ID)) + "\n")
+	sb.WriteString(StyleHeader.Render("Run") + "  " + StyleRunID.Render(ShortID(run.ID)) + "\n")
 	sb.WriteString(HRule(60) + "\n\n")
 
 	field := func(k, v string) {
@@ -115,7 +115,7 @@ func FormatRunDetail(run *agent.Run) string {
 		field("Completed", StyleBase.Render(humanTime(*run.CompletedAt)))
 	}
 	if run.DurationMS > 0 {
-		field("Duration", StyleBase.Render(humanDuration(run.DurationMS)))
+		field("Duration", StyleBase.Render(HumanDuration(run.DurationMS)))
 	}
 	if run.CostUSD > 0 {
 		field("Cost", StyleBase.Render(fmt.Sprintf("$%.4f", run.CostUSD)))
@@ -158,25 +158,27 @@ func FormatRunTable(runs []*agent.Run) string {
 	}
 
 	const (
-		colW  = 10 // short ID
-		agW   = 12
-		stW   = 14
-		timeW = 14
+		idW   = 36 // full UUID
+		agW   = 14
+		stW   = 12
+		timeW = 10
 		costW = 8
 	)
 
-	header := fmt.Sprintf("  %-*s  %-*s  %-*s  %-*s  %-*s",
-		colW, StyleDim.Render("ID"),
-		agW, StyleDim.Render("AGENT"),
-		stW, StyleDim.Render("STATUS"),
-		timeW, StyleDim.Render("CREATED"),
-		costW, StyleDim.Render("COST"),
-	)
+	col := func(s string, w int) string { return fmt.Sprintf("%-*s", w, s) }
+
+	header := "  " + strings.Join([]string{
+		StyleDim.Render(col("ID", idW)),
+		StyleDim.Render(col("AGENT", agW)),
+		StyleDim.Render(col("STATUS", stW)),
+		StyleDim.Render(col("CREATED", timeW)),
+		StyleDim.Render(col("COST", costW)),
+	}, "  ")
 
 	var sb strings.Builder
 	sb.WriteString("\n")
 	sb.WriteString(header + "\n")
-	sb.WriteString("  " + HRule(colW+agW+stW+timeW+costW+8) + "\n")
+	sb.WriteString("  " + HRule(idW+agW+stW+timeW+costW+8) + "\n")
 
 	for _, r := range runs {
 		badge, style := statusBadge(r.Status)
@@ -184,13 +186,13 @@ func FormatRunTable(runs []*agent.Run) string {
 		if r.CostUSD > 0 {
 			cost = fmt.Sprintf("$%.4f", r.CostUSD)
 		}
-		row := fmt.Sprintf("  %-*s  %-*s  %-*s  %-*s  %-*s",
-			colW, StyleRunID.Render(shortID(r.ID)),
-			agW, trunc(r.AgentID, agW),
-			stW, style.Render(trunc(badge, stW)),
-			timeW, StyleDim.Render(relTime(r.CreatedAt)),
-			costW, StyleDim.Render(cost),
-		)
+		row := "  " + strings.Join([]string{
+			StyleRunID.Render(col(r.ID, idW)),
+			StyleBase.Render(col(trunc(r.AgentID, agW), agW)),
+			style.Render(col(trunc(badge, stW), stW)),
+			StyleDim.Render(col(relTime(r.CreatedAt), timeW)),
+			StyleDim.Render(col(cost, costW)),
+		}, "  ")
 		sb.WriteString(row + "\n")
 	}
 	sb.WriteString("\n")
@@ -250,6 +252,13 @@ func eventDetail(e *agent.Event) string {
 		var d agent.FailedData
 		_ = e.DecodeData(&d)
 		return StyleError.Render(d.Error)
+	case agent.EventVerification:
+		var d agent.VerificationData
+		_ = e.DecodeData(&d)
+		if d.Passed {
+			return StyleSuccess.Render("✓ passed") + "  " + trunc(d.Command, 40)
+		}
+		return StyleError.Render("✗ failed") + "  " + trunc(d.Command, 40)
 	default:
 		return ""
 	}
@@ -272,7 +281,8 @@ func statusBadge(s agent.RunStatus) (string, lipgloss.Style) {
 	}
 }
 
-func shortID(id string) string {
+// ShortID returns the first 8 characters of id, or id itself if shorter.
+func ShortID(id string) string {
 	if len(id) <= 8 {
 		return id
 	}
@@ -305,7 +315,8 @@ func relTime(t time.Time) string {
 	}
 }
 
-func humanDuration(ms int64) string {
+// HumanDuration formats a duration in milliseconds as a human-readable string.
+func HumanDuration(ms int64) string {
 	if ms < 1000 {
 		return fmt.Sprintf("%dms", ms)
 	}
@@ -327,7 +338,7 @@ func wrapIndent(s string, indent, width int) string {
 	var lines []string
 	line := prefix
 	for _, w := range words {
-		if len(line)+len(w)+1 > width && line != prefix {
+		if utf8.RuneCountInString(line)+utf8.RuneCountInString(w)+1 > width && line != prefix {
 			lines = append(lines, line)
 			line = prefix + w
 		} else if line == prefix {

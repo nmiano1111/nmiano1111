@@ -102,12 +102,13 @@ type EventKindDisplay struct {
 
 // EventKindDisplays maps event kind strings to display metadata.
 var EventKindDisplays = map[string]EventKindDisplay{
-	"started":     {Label: "▶ started    ", Style: StyleAccent},
-	"text":        {Label: "◆ text       ", Style: StyleBase},
-	"tool_use":    {Label: "⚙ tool_use   ", Style: StyleMauve},
-	"tool_result": {Label: "◇ tool_result", Style: StylePeach},
-	"completed":   {Label: "✓ completed  ", Style: StyleSuccess},
-	"failed":      {Label: "✗ failed     ", Style: StyleError},
+	"started":      {Label: "▶ started    ", Style: StyleAccent},
+	"text":         {Label: "◆ text       ", Style: StyleBase},
+	"tool_use":     {Label: "⚙ tool_use   ", Style: StyleMauve},
+	"tool_result":  {Label: "◇ tool_result", Style: StylePeach},
+	"completed":    {Label: "✓ completed  ", Style: StyleSuccess},
+	"failed":       {Label: "✗ failed     ", Style: StyleError},
+	"verification": {Label: "⊕ verify     ", Style: StyleAccent},
 }
 
 // HRule returns a horizontal rule string of width w.

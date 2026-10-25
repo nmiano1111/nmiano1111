@@ -232,3 +232,111 @@ func TestMCPSchemaNoRequiredField(t *testing.T) {
 		t.Error("_required leaked into tools/list schema output")
 	}
 }
+
+func TestMCPResourcesList(t *testing.T) {
+	orch := makeOrch(t)
+
+	// Populate a run.
+	exec, err := orch.Start(context.Background(), agent.RunRequest{
+		AgentID: "test",
+		Prompt:  "hello resources",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range exec.Events {
+	}
+
+	results := runSession(t, orch,
+		map[string]any{"jsonrpc": "2.0", "id": 1, "method": "resources/list", "params": map[string]any{}},
+	)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(results))
+	}
+	res := results[0]
+	if res["error"] != nil {
+		t.Fatalf("unexpected error: %v", res["error"])
+	}
+	result, _ := res["result"].(map[string]any)
+	resources, _ := result["resources"].([]any)
+	if len(resources) == 0 {
+		t.Fatal("expected at least one resource")
+	}
+	// Check the first resource has the expected URI prefix.
+	first, _ := resources[0].(map[string]any)
+	uri, _ := first["uri"].(string)
+	if !strings.HasPrefix(uri, "nickbot://runs/") {
+		t.Errorf("resource URI = %q, want prefix nickbot://runs/", uri)
+	}
+}
+
+func TestMCPResourcesReadBadURI(t *testing.T) {
+	orch := makeOrch(t)
+	results := runSession(t, orch,
+		map[string]any{
+			"jsonrpc": "2.0", "id": 1, "method": "resources/read",
+			"params": map[string]any{"uri": "not-a-nickbot-uri"},
+		},
+	)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(results))
+	}
+	if results[0]["error"] == nil {
+		t.Error("expected RPC error for bad URI, got nil")
+	}
+}
+
+func TestMCPResourcesReadNotFound(t *testing.T) {
+	orch := makeOrch(t)
+	results := runSession(t, orch,
+		map[string]any{
+			"jsonrpc": "2.0", "id": 1, "method": "resources/read",
+			"params": map[string]any{"uri": "nickbot://runs/nonexistent-id"},
+		},
+	)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(results))
+	}
+	if results[0]["error"] == nil {
+		t.Error("expected RPC error for non-existent run, got nil")
+	}
+}
+
+func TestMCPResourcesRead(t *testing.T) {
+	orch := makeOrch(t)
+
+	exec, err := orch.Start(context.Background(), agent.RunRequest{
+		AgentID: "test",
+		Prompt:  "read me",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range exec.Events {
+	}
+	runID := exec.Run.ID
+
+	results := runSession(t, orch,
+		map[string]any{
+			"jsonrpc": "2.0", "id": 1, "method": "resources/read",
+			"params": map[string]any{"uri": "nickbot://runs/" + runID},
+		},
+	)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 response, got %d", len(results))
+	}
+	res := results[0]
+	if res["error"] != nil {
+		t.Fatalf("unexpected error: %v", res["error"])
+	}
+	result, _ := res["result"].(map[string]any)
+	contents, _ := result["contents"].([]any)
+	if len(contents) == 0 {
+		t.Fatal("expected contents in resources/read response")
+	}
+	content, _ := contents[0].(map[string]any)
+	text, _ := content["text"].(string)
+	if !strings.Contains(text, runID) {
+		t.Errorf("expected run ID in resource text, got: %s", text)
+	}
+}

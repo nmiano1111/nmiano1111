@@ -17,20 +17,18 @@ import (
 
 	"github.com/nmiano/nickbot/internal/agent"
 	"github.com/nmiano/nickbot/internal/store"
+	"github.com/nmiano/nickbot/internal/verifier"
 )
 
 // Execution is an in-progress or completed agent run.
-// The Run field is updated as the execution progresses; callers must not
-// assume it is final until the Events channel is closed.
+// The Run field reflects the state at the moment Start() returned; it is not
+// updated after that. Callers should re-fetch from the store for final state.
 type Execution struct {
-	// Run is the initial run record. It is updated in place by the orchestrator.
-	Run *agent.Run
-	// Events streams execution events. Closed when execution terminates.
+	Run    *agent.Run
 	Events <-chan agent.Event
 }
 
-// Orchestrator coordinates single-agent execution for Milestone 1.
-// In future milestones it will extend to multi-agent workflows.
+// Orchestrator coordinates agent execution.
 type Orchestrator struct {
 	runner agent.Runner
 	store  store.Store
@@ -46,12 +44,10 @@ func New(runner agent.Runner, st store.Store, log *slog.Logger) *Orchestrator {
 }
 
 // Start creates a run record, begins execution, and returns an Execution handle.
-// The caller consumes handle.Events; the orchestrator persists events and updates
-// the run concurrently. The Events channel is closed when execution ends.
-//
-// Cancelling ctx propagates to the runner and terminates execution.
+// The caller drains handle.Events; the orchestrator persists events and updates
+// the run concurrently. The Events channel is closed when execution (and any
+// post-run verification) ends.
 func (o *Orchestrator) Start(ctx context.Context, req agent.RunRequest) (*Execution, error) {
-	// Assign a run ID if the caller didn't supply one.
 	if req.RunID == "" {
 		req.RunID = uuid.New().String()
 	}
@@ -59,26 +55,40 @@ func (o *Orchestrator) Start(ctx context.Context, req agent.RunRequest) (*Execut
 		req.AgentID = o.runner.Name()
 	}
 
+	// Apply timeout to the execution context.
+	execCtx := ctx
+	var timeoutCancel context.CancelFunc
+	if req.Config.TimeoutMS > 0 {
+		execCtx, timeoutCancel = context.WithTimeout(ctx, time.Duration(req.Config.TimeoutMS)*time.Millisecond)
+	}
+
 	// Fork a git worktree for isolation if requested.
-	var worktreePath string
+	var worktreePath, gitRoot string
 	if req.Config.IsolateWorktree {
+		var err error
 		baseDir := req.Config.WorkDir
 		if baseDir == "" {
-			var err error
 			baseDir, err = os.Getwd()
 			if err != nil {
+				if timeoutCancel != nil {
+					timeoutCancel()
+				}
 				return nil, fmt.Errorf("orchestrator: get workdir: %w", err)
 			}
 		}
-		wt, err := forkWorktree(baseDir, req.RunID)
+		var wt string
+		wt, gitRoot, err = forkWorktree(baseDir, req.RunID)
 		if err != nil {
+			if timeoutCancel != nil {
+				timeoutCancel()
+			}
 			return nil, fmt.Errorf("orchestrator: worktree: %w", err)
 		}
 		worktreePath = wt
 		req.Config.WorkDir = wt
 	}
 
-	// Persist the initial run record (status = pending).
+	// Persist the initial run record.
 	run := &agent.Run{
 		ID:          req.RunID,
 		AgentID:     req.AgentID,
@@ -90,67 +100,81 @@ func (o *Orchestrator) Start(ctx context.Context, req agent.RunRequest) (*Execut
 		ParentRunID: req.ParentRunID,
 	}
 	if err := o.store.CreateRun(ctx, run); err != nil {
+		if timeoutCancel != nil {
+			timeoutCancel()
+		}
 		if worktreePath != "" {
-			removeWorktree(worktreePath)
+			removeWorktree(gitRoot, worktreePath)
 		}
 		return nil, fmt.Errorf("orchestrator: persist run: %w", err)
 	}
 
-	// Start the runner. This may fail immediately (e.g. binary not found).
-	runnerCh, err := o.runner.Run(ctx, req)
+	// Start the runner.
+	runnerCh, err := o.runner.Run(execCtx, req)
 	if err != nil {
 		run.Status = agent.RunStatusFailed
 		run.Error = err.Error()
 		now := time.Now()
 		run.CompletedAt = &now
 		_ = o.store.UpdateRun(ctx, run)
+		if timeoutCancel != nil {
+			timeoutCancel()
+		}
 		if worktreePath != "" {
-			removeWorktree(worktreePath)
+			removeWorktree(gitRoot, worktreePath)
 		}
 		return nil, fmt.Errorf("orchestrator: start runner: %w", err)
 	}
 
-	// Transition to running. Snapshot the run for the caller; the goroutine
-	// works on a private mutable copy to avoid data races.
 	now := time.Now()
 	run.Status = agent.RunStatusRunning
 	run.StartedAt = &now
-	_ = o.store.UpdateRun(ctx, run)
+	if err := o.store.UpdateRun(context.Background(), run); err != nil {
+		o.log.Warn("failed to persist running status", slog.String("run_id", run.ID), slog.Any("err", err))
+	}
 
-	// callerRun is the immutable snapshot returned to the caller.
-	// It reflects the state at the moment Start() returns.
 	callerRun := *run
-
-	// localRun is the private copy mutated by the background goroutine.
 	localRun := *run
-
-	// The outbound channel that callers observe.
 	outCh := make(chan agent.Event, 64)
 
 	go func() {
-		// Always persist final run state, even on cancellation.
 		defer func() {
-			if localRun.Status == agent.RunStatusRunning {
-				// Runner closed channel without a terminal event.
-				localRun.Status = agent.RunStatusFailed
-				localRun.Error = "runner closed without terminal event"
-				t := time.Now()
-				localRun.CompletedAt = &t
+			if timeoutCancel != nil {
+				timeoutCancel()
+			}
+			// agentctl cancel writes RunStatusCancelled to the store before sending
+			// SIGTERM. The runner may still emit EventFailed when it exits, so we
+			// check the store for external cancellation regardless of current status.
+			if localRun.Status == agent.RunStatusRunning || localRun.Status == agent.RunStatusFailed {
+				if stored, err := o.store.GetRun(context.Background(), localRun.ID); err == nil &&
+					stored.Status == agent.RunStatusCancelled {
+					localRun.Status = agent.RunStatusCancelled
+					localRun.Error = ""
+					if stored.CompletedAt != nil {
+						localRun.CompletedAt = stored.CompletedAt
+					}
+				} else if localRun.Status == agent.RunStatusRunning {
+					// No terminal event and not cancelled: generic failure.
+					localRun.Status = agent.RunStatusFailed
+					localRun.Error = "runner closed without terminal event"
+					t := time.Now()
+					localRun.CompletedAt = &t
+				}
 			}
 			if err := o.store.UpdateRun(context.Background(), &localRun); err != nil {
 				o.log.Warn("failed to persist final run state",
-					slog.String("run_id", localRun.ID),
-					slog.Any("err", err))
+					slog.String("run_id", localRun.ID), slog.Any("err", err))
 			}
 			if worktreePath != "" {
-				removeWorktree(worktreePath)
+				removeWorktree(gitRoot, worktreePath)
 			}
 			close(outCh)
 		}()
 
+		seq := 0 // tracks next event seq for verifier event
 		for e := range runnerCh {
-			// Persist using a background context so cancellation of the
-			// execution context does not prevent us from recording events.
+			seq = e.Seq + 1
+
 			if err := o.store.AppendEvent(context.Background(), &e); err != nil {
 				o.log.Warn("failed to persist event",
 					slog.String("run_id", localRun.ID),
@@ -158,21 +182,51 @@ func (o *Orchestrator) Start(ctx context.Context, req agent.RunRequest) (*Execut
 					slog.Any("err", err))
 			}
 
-			// Update local run state based on terminal events.
 			switch e.Kind {
+			case agent.EventStarted:
+				// Capture the subprocess PID so agentctl cancel can signal it.
+				var sd agent.StartedData
+				if e.DecodeData(&sd) == nil && sd.PID > 0 {
+					localRun.PID = sd.PID
+					_ = o.store.UpdateRun(context.Background(), &localRun)
+				}
 			case agent.EventCompleted:
 				applyCompleted(&localRun, e)
 			case agent.EventFailed:
 				applyFailed(&localRun, e)
 			}
 
-			// Forward to caller (outCh is buffered; non-blocking under normal load).
-			select {
-			case outCh <- e:
-			default:
-				// Drop the event if the caller isn't consuming fast enough.
-				// This is acceptable: the event is already persisted.
+			outCh <- e // block until caller drains; never drop events
+		}
+
+		// Clear PID now that the subprocess has exited.
+		if localRun.PID != 0 {
+			localRun.PID = 0
+		}
+
+		// Run post-completion verifier if configured and run succeeded.
+		if req.Config.Verify != "" && localRun.Status == agent.RunStatusCompleted {
+			workDir := req.Config.WorkDir
+			if worktreePath != "" {
+				workDir = worktreePath
 			}
+			v := &verifier.Shell{Command: req.Config.Verify}
+			result, err := v.Verify(context.Background(), workDir) // detached: caller ctx may already be done
+			if err != nil {
+				result.Passed = false
+				result.Output = err.Error()
+			}
+
+			ve := agent.MakeEvent(req.RunID, seq, agent.EventVerification, agent.VerificationData{
+				Command: result.Command,
+				Passed:  result.Passed,
+				Output:  result.Output,
+			})
+			if persistErr := o.store.AppendEvent(context.Background(), &ve); persistErr != nil {
+				o.log.Warn("failed to persist verification event",
+					slog.String("run_id", localRun.ID), slog.Any("err", persistErr))
+			}
+			outCh <- ve // block until caller drains
 		}
 	}()
 
@@ -184,7 +238,7 @@ func (o *Orchestrator) GetRun(ctx context.Context, id string) (*agent.Run, error
 	return o.store.GetRun(ctx, id)
 }
 
-// ListRuns retrieves recent run records.
+// ListRuns retrieves run records ordered by creation time descending.
 func (o *Orchestrator) ListRuns(ctx context.Context, limit int) ([]*agent.Run, error) {
 	return o.store.ListRuns(ctx, limit)
 }
@@ -222,26 +276,20 @@ func applyFailed(run *agent.Run, e agent.Event) {
 
 // ── Worktree isolation ────────────────────────────────────────────────────────
 
-// forkWorktree creates a git worktree at a temp path derived from runID.
-// The worktree is a lightweight copy of baseDir's HEAD commit.
-func forkWorktree(baseDir, runID string) (string, error) {
-	// Find the git root of baseDir.
+func forkWorktree(baseDir, runID string) (string, string, error) {
 	out, err := exec.Command("git", "-C", baseDir, "rev-parse", "--show-toplevel").Output()
 	if err != nil {
-		return "", fmt.Errorf("not a git repository: %w", err)
+		return "", "", fmt.Errorf("not a git repository: %w", err)
 	}
 	gitRoot := strings.TrimSpace(string(out))
-
-	worktreePath := filepath.Join(os.TempDir(), "nickbot-worktrees", runID[:8])
+	worktreePath := filepath.Join(os.TempDir(), "nickbot-worktrees", runID) // full ID avoids collisions
 	cmd := exec.Command("git", "-C", gitRoot, "worktree", "add", "--detach", worktreePath, "HEAD")
 	if combined, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("git worktree add: %w\n%s", err, combined)
+		return "", "", fmt.Errorf("git worktree add: %w\n%s", err, combined)
 	}
-	return worktreePath, nil
+	return worktreePath, gitRoot, nil
 }
 
-// removeWorktree removes a git worktree created by forkWorktree.
-func removeWorktree(path string) {
-	// --force handles the case where the worktree has uncommitted changes.
-	exec.Command("git", "worktree", "remove", "--force", path).Run() //nolint:errcheck
+func removeWorktree(gitRoot, path string) {
+	exec.Command("git", "-C", gitRoot, "worktree", "remove", "--force", path).Run() //nolint:errcheck
 }

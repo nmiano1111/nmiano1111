@@ -38,12 +38,13 @@ type Model struct {
 	// EventCh is the channel of incoming events.
 	EventCh <-chan agent.Event
 
-	spinner   spinner.Model
-	events    []renderedEvent
-	done      bool
-	width     int
-	height    int
-	startedAt time.Time
+	spinner      spinner.Model
+	events       []renderedEvent
+	done         bool          // channel has closed; TUI should quit
+	terminalKind agent.EventKind // kind of last terminal event (completed/failed/verification)
+	width        int
+	height       int
+	startedAt    time.Time
 }
 
 type renderedEvent struct {
@@ -94,15 +95,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case EventMsg:
 		e := agent.Event(msg)
 		m.events = append(m.events, renderEvent(e))
-		if e.Kind == agent.EventCompleted || e.Kind == agent.EventFailed {
-			m.done = true
-			return m, tea.Sequence(
-				tea.Tick(300*time.Millisecond, func(t time.Time) tea.Msg { return DoneMsg{} }),
-			)
+		switch e.Kind {
+		case agent.EventCompleted, agent.EventFailed, agent.EventVerification:
+			m.terminalKind = e.Kind
 		}
+		// Always keep reading; quit when the channel closes (DoneMsg).
 		return m, waitEvent(m.EventCh)
 
 	case DoneMsg:
+		m.done = true
 		return m, tea.Quit
 
 	case errMsg:
@@ -124,7 +125,7 @@ func (m Model) View() string {
 
 	// ── Header ────────────────────────────────────────────────────────────────
 	appName := ui.StyleAccent.Bold(true).Render("agentctl")
-	runIDStr := ui.StyleRunID.Render(shortID(m.Run.ID))
+	runIDStr := ui.StyleRunID.Render(ui.ShortID(m.Run.ID))
 	headerRight := ui.StyleDim.Render(m.Run.RunnerName)
 	headerLine := fmt.Sprintf("%s  ·  Run %s  ·  %s", appName, runIDStr, headerRight)
 	sb.WriteString("\n" + headerLine + "\n")
@@ -132,15 +133,20 @@ func (m Model) View() string {
 
 	// ── Meta ──────────────────────────────────────────────────────────────────
 	ds := ui.DeriveDisplayStatus(m.Run)
-	if m.done {
-		// Re-derive from last event kind for accuracy.
-		for i := len(m.events) - 1; i >= 0; i-- {
-			if m.events[i].isErr {
+	if m.terminalKind != "" {
+		// Derive status from the last terminal event, including verification.
+		switch m.terminalKind {
+		case agent.EventFailed:
+			ds = ui.DisplayFailed
+		case agent.EventVerification:
+			// Check whether the verification passed by inspecting the last event.
+			if len(m.events) > 0 && m.events[len(m.events)-1].isErr {
 				ds = ui.DisplayFailed
-			} else if ds != ui.DisplayFailed {
+			} else {
 				ds = ui.DisplayCompleted
 			}
-			break
+		default:
+			ds = ui.DisplayCompleted
 		}
 	}
 	badge, badgeStyle := ui.DisplayStatusBadge(ds)
@@ -266,9 +272,16 @@ func renderEvent(e agent.Event) renderedEvent {
 		display.Style.Render(display.Label),
 		detailStyle.Render(detail),
 	)
+	isErr := e.Kind == agent.EventFailed
+	if e.Kind == agent.EventVerification {
+		var d agent.VerificationData
+		if e.DecodeData(&d) == nil {
+			isErr = !d.Passed
+		}
+	}
 	return renderedEvent{
 		line:  line,
-		isErr: e.Kind == agent.EventFailed,
+		isErr: isErr,
 	}
 }
 
@@ -307,13 +320,20 @@ func eventDetail(e agent.Event) string {
 			return fmt.Sprintf("%s  ($%.4f · %d tokens · %s)",
 				truncStr(d.Result, 30), d.CostUSD,
 				d.InputTokens+d.OutputTokens,
-				humanDuration(d.DurationMS))
+				ui.HumanDuration(d.DurationMS))
 		}
 		return truncStr(d.Result, 60)
 	case agent.EventFailed:
 		var d agent.FailedData
 		_ = e.DecodeData(&d)
 		return d.Error
+	case agent.EventVerification:
+		var d agent.VerificationData
+		_ = e.DecodeData(&d)
+		if d.Passed {
+			return "✓ passed  " + truncStr(d.Command, 40)
+		}
+		return "✗ failed  " + truncStr(d.Command, 40)
 	default:
 		return ""
 	}
@@ -327,20 +347,3 @@ func truncStr(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
-func shortID(id string) string {
-	if len(id) <= 8 {
-		return id
-	}
-	return id[:8]
-}
-
-func humanDuration(ms int64) string {
-	if ms < 1000 {
-		return fmt.Sprintf("%dms", ms)
-	}
-	s := float64(ms) / 1000.0
-	if s < 60 {
-		return fmt.Sprintf("%.1fs", s)
-	}
-	return fmt.Sprintf("%.0fm", s/60)
-}

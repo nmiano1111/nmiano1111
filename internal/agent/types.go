@@ -26,6 +26,9 @@ const (
 	EventCompleted EventKind = "completed"
 	// EventFailed signals that the run ended with an error.
 	EventFailed EventKind = "failed"
+	// EventVerification is emitted after completion when a verifier is configured.
+	// It follows EventCompleted and precedes channel close.
+	EventVerification EventKind = "verification"
 )
 
 // Event is a structured record of something that occurred during execution.
@@ -38,6 +41,12 @@ type Event struct {
 	Seq       int             `json:"seq"`        // monotonic within a run
 	ParentSeq *int            `json:"parent_seq,omitempty"` // links tool_result → tool_use
 	Data      json.RawMessage `json:"data,omitempty"`
+}
+
+// StartedData is the payload for EventStarted events.
+type StartedData struct {
+	// PID is the OS process ID of the runner subprocess, if applicable.
+	PID int `json:"pid,omitempty"`
 }
 
 // TextData is the payload for EventText events.
@@ -71,6 +80,13 @@ type CompletedData struct {
 // FailedData is the payload for EventFailed events.
 type FailedData struct {
 	Error string `json:"error"`
+}
+
+// VerificationData is the payload for EventVerification events.
+type VerificationData struct {
+	Command string `json:"command"`
+	Passed  bool   `json:"passed"`
+	Output  string `json:"output,omitempty"`
 }
 
 // ── Run ──────────────────────────────────────────────────────────────────────
@@ -109,6 +125,9 @@ type Run struct {
 	Model string `json:"model,omitempty"`
 	// ParentRunID is set when this run was spawned as a child of another run.
 	ParentRunID string `json:"parent_run_id,omitempty"`
+	// PID is the OS process ID of the runner subprocess while running.
+	// Zero if the runner doesn't track process IDs.
+	PID int `json:"pid,omitempty"`
 }
 
 // ── RunRequest ───────────────────────────────────────────────────────────────
@@ -146,4 +165,9 @@ type RunConfig struct {
 	// current directory) before starting the runner. The agent works in the
 	// worktree; changes are isolated until explicitly merged.
 	IsolateWorktree bool
+	// TimeoutMS, if > 0, cancels the run after this many milliseconds.
+	TimeoutMS int64
+	// Verify is a shell command run after successful completion to validate
+	// the agent's output. Results are emitted as EventVerification.
+	Verify string
 }

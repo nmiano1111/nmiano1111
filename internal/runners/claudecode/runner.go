@@ -96,7 +96,7 @@ func (r *Runner) Run(ctx context.Context, req agent.RunRequest) (<-chan agent.Ev
 			return thisSeq
 		}
 
-		emit(agent.EventStarted, nil, nil)
+		emit(agent.EventStarted, agent.StartedData{PID: cmd.Process.Pid}, nil)
 
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024) // 4 MB

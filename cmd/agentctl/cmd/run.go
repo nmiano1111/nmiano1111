@@ -28,6 +28,8 @@ func newRunCmd() *cobra.Command {
 		workDir  string
 		permMode string
 		isolate  bool
+		timeout  float64
+		verify   string
 	}
 
 	cmd := &cobra.Command{
@@ -41,11 +43,13 @@ Examples:
   agentctl run "List the files in the current directory"
   agentctl run --runner fake "Test task"
   agentctl run --runner claude --model claude-sonnet-4-6 "Write a haiku about Go"
+  agentctl run --timeout 120 "Long-running task"
+  agentctl run --verify "go test ./..." "Fix the failing tests"
   agentctl run --json "Analyse the repository" | jq .`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			prompt := strings.Join(args, " ")
-			return runExecute(cmd.Context(), prompt, flags.runner, flags.model, flags.agent, flags.tools, flags.workDir, flags.permMode, flags.isolate)
+			return runExecute(cmd.Context(), prompt, flags.runner, flags.model, flags.agent, flags.tools, flags.workDir, flags.permMode, flags.isolate, flags.timeout, flags.verify)
 		},
 	}
 
@@ -56,11 +60,13 @@ Examples:
 	cmd.Flags().StringVar(&flags.workDir, "workdir", "", "working directory for tool execution")
 	cmd.Flags().StringVar(&flags.permMode, "permission-mode", "", "claude permission mode: acceptEdits|bypassPermissions|default|dontAsk (default: acceptEdits)")
 	cmd.Flags().BoolVar(&flags.isolate, "isolate", false, "fork a git worktree for filesystem isolation")
+	cmd.Flags().Float64Var(&flags.timeout, "timeout", 0, "cancel the run after this many seconds (0 = no timeout)")
+	cmd.Flags().StringVar(&flags.verify, "verify", "", "shell command to run after successful completion to validate output")
 
 	return cmd
 }
 
-func runExecute(ctx context.Context, prompt, runnerName, model, agentID string, tools []string, workDir, permMode string, isolate bool) error {
+func runExecute(ctx context.Context, prompt, runnerName, model, agentID string, tools []string, workDir, permMode string, isolate bool, timeoutSec float64, verify string) error {
 	// Select runner.
 	var runner agent.Runner
 	switch runnerName {
@@ -100,6 +106,8 @@ func runExecute(ctx context.Context, prompt, runnerName, model, agentID string, 
 			WorkDir:         workDir,
 			PermissionMode:  permMode,
 			IsolateWorktree: isolate,
+			TimeoutMS:       int64(timeoutSec * 1000),
+			Verify:          verify,
 		},
 	}
 
@@ -129,9 +137,21 @@ func streamTUI(exec *orchestration.Execution) error {
 	}
 
 	// Print a compact completion summary after the TUI exits.
+	// Re-fetch the run from the store to get the final status (exec.Run is a
+	// snapshot taken at Start() time and always shows "running").
 	if lm, ok := final.(live.Model); ok {
 		fmt.Print(lm.FinalView())
-		printRunSummary(exec.Run)
+		st, err := openStore()
+		if err == nil {
+			if r, err := st.GetRun(context.Background(), exec.Run.ID); err == nil {
+				printRunSummary(r)
+			} else {
+				printRunSummary(exec.Run)
+			}
+			st.Close()
+		} else {
+			printRunSummary(exec.Run)
+		}
 	}
 	return nil
 }
@@ -154,6 +174,8 @@ func printRunSummary(run *agent.Run) {
 		badge, style = ui.BadgeCompleted, ui.StyleSuccess
 	case agent.RunStatusFailed:
 		badge, style = ui.BadgeFailed, ui.StyleError
+	case agent.RunStatusCancelled:
+		badge, style = ui.BadgeCancelled, ui.StyleDim
 	default:
 		badge, style = ui.BadgePending, ui.StyleWarning
 	}

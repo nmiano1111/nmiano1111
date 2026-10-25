@@ -109,6 +109,10 @@ func (s *server) dispatch(ctx context.Context, method string, params json.RawMes
 		return s.handleToolsList()
 	case "tools/call":
 		return s.handleToolsCall(ctx, params)
+	case "resources/list":
+		return s.handleResourcesList(ctx)
+	case "resources/read":
+		return s.handleResourcesRead(ctx, params)
 	case "ping":
 		return map[string]any{}, nil
 	default:
@@ -130,11 +134,12 @@ func (s *server) handleInitialize(_ json.RawMessage) (any, *rpcError) {
 	return map[string]any{
 		"protocolVersion": protocolVersion,
 		"capabilities": map[string]any{
-			"tools": map[string]any{},
+			"tools":     map[string]any{},
+			"resources": map[string]any{},
 		},
 		"serverInfo": map[string]any{
 			"name":    "nickbot",
-			"version": "0.2.0",
+			"version": "0.3.0",
 		},
 	}, nil
 }
@@ -175,10 +180,89 @@ func toolResult(text string, isError bool) map[string]any {
 	}
 }
 
+// ── Resource handlers ─────────────────────────────────────────────────────────
+
+// handleResourcesList returns recent runs as MCP resources.
+// Each run is addressable as nickbot://runs/<run-id>.
+func (s *server) handleResourcesList(ctx context.Context) (any, *rpcError) {
+	runs, err := s.orch.ListRuns(ctx, 20)
+	if err != nil {
+		return nil, &rpcError{Code: -32603, Message: "list runs: " + err.Error()}
+	}
+
+	resources := make([]map[string]any, 0, len(runs))
+	for _, r := range runs {
+		desc := fmt.Sprintf("[%s] %s", r.Status, truncate(r.Prompt, 60))
+		resources = append(resources, map[string]any{
+			"uri":      "nickbot://runs/" + r.ID,
+			"name":     "run/" + shortID(r.ID),
+			"mimeType": "application/json",
+			"description": desc,
+		})
+	}
+	return map[string]any{"resources": resources}, nil
+}
+
+type resourcesReadParams struct {
+	URI string `json:"uri"`
+}
+
+// handleResourcesRead returns the full run record and its events as JSON.
+func (s *server) handleResourcesRead(ctx context.Context, params json.RawMessage) (any, *rpcError) {
+	var p resourcesReadParams
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, &rpcError{Code: -32602, Message: "invalid params: " + err.Error()}
+	}
+
+	runID := strings.TrimPrefix(p.URI, "nickbot://runs/")
+	if runID == p.URI {
+		return nil, &rpcError{Code: -32602, Message: "unsupported resource URI: " + p.URI}
+	}
+
+	run, err := s.orch.GetRun(ctx, runID)
+	if err != nil {
+		return nil, &rpcError{Code: -32603, Message: "get run: " + err.Error()}
+	}
+
+	events, err := s.orch.ListEvents(ctx, runID)
+	if err != nil {
+		return nil, &rpcError{Code: -32603, Message: "list events: " + err.Error()}
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"run":    run,
+		"events": events,
+	})
+	if err != nil {
+		return nil, &rpcError{Code: -32603, Message: "marshal: " + err.Error()}
+	}
+
+	return map[string]any{
+		"contents": []map[string]any{
+			{
+				"uri":      p.URI,
+				"mimeType": "application/json",
+				"text":     string(payload),
+			},
+		},
+	}, nil
+}
+
+func truncate(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n-1]) + "…"
+}
+
 // ── Framing ───────────────────────────────────────────────────────────────────
+
+const maxMessageSize = 64 * 1024 * 1024 // 64 MB sanity cap
 
 func readMessage(r *bufio.Reader) ([]byte, error) {
 	var contentLength int
+	sawContentLength := false
 	for {
 		line, err := r.ReadString('\n')
 		if err != nil {
@@ -194,10 +278,14 @@ func readMessage(r *bufio.Reader) ([]byte, error) {
 				return nil, fmt.Errorf("bad Content-Length: %w", err)
 			}
 			contentLength = n
+			sawContentLength = true
 		}
 	}
-	if contentLength == 0 {
-		return nil, fmt.Errorf("missing Content-Length")
+	if !sawContentLength {
+		return nil, fmt.Errorf("missing Content-Length header")
+	}
+	if contentLength < 0 || contentLength > maxMessageSize {
+		return nil, fmt.Errorf("Content-Length %d out of range (max %d)", contentLength, maxMessageSize)
 	}
 	body := make([]byte, contentLength)
 	if _, err := io.ReadFull(r, body); err != nil {

@@ -68,6 +68,9 @@ func callTool(ctx context.Context, orch *orchestration.Orchestrator, name string
 
 // ── Tool handlers ─────────────────────────────────────────────────────────────
 
+// toolStartRun starts an agent run and blocks until it completes.
+// NOTE: This blocks the MCP serve loop for the duration of the run.
+// Concurrent MCP requests cannot be served while start_run is in progress.
 func toolStartRun(ctx context.Context, orch *orchestration.Orchestrator, args map[string]any) (string, error) {
 	prompt, _ := args["prompt"].(string)
 	if prompt == "" {
@@ -164,7 +167,7 @@ func toolListRuns(ctx context.Context, orch *orchestration.Orchestrator, args ma
 		if len(prompt) > 60 {
 			prompt = prompt[:57] + "..."
 		}
-		fmt.Fprintf(&sb, "[%s]  %-9s  %s  %s\n", r.ID[:8], r.Status, ts, prompt)
+		fmt.Fprintf(&sb, "[%s]  %-9s  %s  %s\n", shortID(r.ID), r.Status, ts, prompt)
 	}
 	return sb.String(), nil
 }
@@ -212,22 +215,41 @@ func toolGetEvents(ctx context.Context, orch *orchestration.Orchestrator, args m
 
 func schema(properties map[string]any) map[string]any {
 	var required []string
+	// Build a clean copy of properties without the internal _required sentinel,
+	// so we never mutate the caller's map.
+	cleanProps := make(map[string]any, len(properties))
 	for k, v := range properties {
 		if p, ok := v.(map[string]any); ok {
 			if req, _ := p["_required"].(bool); req {
 				required = append(required, k)
 			}
-			delete(p, "_required") // always remove the internal sentinel
+			clean := make(map[string]any, len(p))
+			for pk, pv := range p {
+				if pk != "_required" {
+					clean[pk] = pv
+				}
+			}
+			cleanProps[k] = clean
+		} else {
+			cleanProps[k] = v
 		}
 	}
 	s := map[string]any{
 		"type":       "object",
-		"properties": properties,
+		"properties": cleanProps,
 	}
 	if len(required) > 0 {
 		s["required"] = required
 	}
 	return s
+}
+
+// shortID returns the first 8 characters of id, or id itself if shorter.
+func shortID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8]
 }
 
 func prop(typ, description string, required bool) map[string]any {

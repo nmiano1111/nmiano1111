@@ -36,7 +36,9 @@ CREATE TABLE IF NOT EXISTS runs (
     cost_usd      REAL NOT NULL DEFAULT 0,
     input_tokens  INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
-    duration_ms   INTEGER NOT NULL DEFAULT 0
+    duration_ms   INTEGER NOT NULL DEFAULT 0,
+    parent_run_id TEXT NOT NULL DEFAULT '',
+    pid           INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -68,10 +70,16 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: open: %w", err)
 	}
-	// SQLite performs best with a single writer; WAL mode improves concurrency.
-	if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;"); err != nil {
+	// Restrict to one connection: SQLite is single-writer and PRAGMAs like
+	// foreign_keys are per-connection; with one connection they apply uniformly.
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("sqlite: pragma: %w", err)
+		return nil, fmt.Errorf("sqlite: pragma journal_mode: %w", err)
+	}
+	if _, err := db.Exec("PRAGMA foreign_keys=ON"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("sqlite: pragma foreign_keys: %w", err)
 	}
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
@@ -82,7 +90,49 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("sqlite: migrate: %w", err)
 	}
+	if err := s.recoverOrphans(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("sqlite: recover: %w", err)
+	}
 	return s, nil
+}
+
+// recoverOrphans marks runs stuck in "running" as failed, but only if their
+// recorded process is no longer alive. Live runs are left untouched.
+func (s *Store) recoverOrphans() error {
+	rows, err := s.db.Query(`SELECT id, pid FROM runs WHERE status='running'`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	var orphans []string
+	for rows.Next() {
+		var id string
+		var pid int
+		if err := rows.Scan(&id, &pid); err != nil {
+			return fmt.Errorf("recover: scan row: %w", err)
+		}
+		if pid > 0 && pidAlive(pid) {
+			continue // process still running; leave it alone
+		}
+		orphans = append(orphans, id)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	now := time.Now()
+	nowStr := nullTime(&now) // use the same format as all other time writes
+	for _, id := range orphans {
+		if _, err := s.db.Exec(
+			`UPDATE runs SET status='failed', error='run was orphaned (process restarted)', pid=0, completed_at=? WHERE id=?`,
+			nowStr, id,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // migrate applies schema additions for databases created before M2.
@@ -92,6 +142,7 @@ func (s *Store) migrate() error {
 	stmts := []string{
 		`ALTER TABLE runs ADD COLUMN parent_run_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE events ADD COLUMN parent_seq INTEGER`,
+		`ALTER TABLE runs ADD COLUMN pid INTEGER NOT NULL DEFAULT 0`,
 		// Partial index on parent_run_id — created after the column exists.
 		`CREATE INDEX IF NOT EXISTS idx_runs_parent ON runs(parent_run_id) WHERE parent_run_id != ''`,
 	}
@@ -120,12 +171,12 @@ func (s *Store) CreateRun(ctx context.Context, r *agent.Run) error {
 			(id, agent_id, prompt, status, runner_name, model,
 			 created_at, started_at, completed_at,
 			 result, error, cost_usd, input_tokens, output_tokens, duration_ms,
-			 parent_run_id)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			 parent_run_id, pid)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.AgentID, r.Prompt, string(r.Status), r.RunnerName, r.Model,
 		r.CreatedAt.UTC(), nullTime(r.StartedAt), nullTime(r.CompletedAt),
 		r.Result, r.Error, r.CostUSD, r.InputTokens, r.OutputTokens, r.DurationMS,
-		r.ParentRunID,
+		r.ParentRunID, r.PID,
 	)
 	if err != nil {
 		return fmt.Errorf("sqlite: create run: %w", err)
@@ -140,12 +191,12 @@ func (s *Store) UpdateRun(ctx context.Context, r *agent.Run) error {
 			status=?, runner_name=?, model=?,
 			started_at=?, completed_at=?,
 			result=?, error=?, cost_usd=?, input_tokens=?, output_tokens=?, duration_ms=?,
-			parent_run_id=?
+			parent_run_id=?, pid=?
 		WHERE id=?`,
 		string(r.Status), r.RunnerName, r.Model,
 		nullTime(r.StartedAt), nullTime(r.CompletedAt),
 		r.Result, r.Error, r.CostUSD, r.InputTokens, r.OutputTokens, r.DurationMS,
-		r.ParentRunID,
+		r.ParentRunID, r.PID,
 		r.ID,
 	)
 	if err != nil {
@@ -163,7 +214,7 @@ func (s *Store) GetRun(ctx context.Context, id string) (*agent.Run, error) {
 		SELECT id, agent_id, prompt, status, runner_name, model,
 		       created_at, started_at, completed_at,
 		       result, error, cost_usd, input_tokens, output_tokens, duration_ms,
-		       parent_run_id
+		       parent_run_id, pid
 		FROM runs WHERE id=?`, id)
 	r, err := scanRun(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -180,7 +231,7 @@ func (s *Store) ListRuns(ctx context.Context, limit int) ([]*agent.Run, error) {
 	q := `SELECT id, agent_id, prompt, status, runner_name, model,
 	             created_at, started_at, completed_at,
 	             result, error, cost_usd, input_tokens, output_tokens, duration_ms,
-	             parent_run_id
+	             parent_run_id, pid
 	      FROM runs ORDER BY created_at DESC`
 	var args []any
 	if limit > 0 {
@@ -242,7 +293,9 @@ func (s *Store) ListEvents(ctx context.Context, runID string) ([]*agent.Event, e
 		if err := rows.Scan(&e.ID, &e.RunID, &e.Seq, (*string)(&e.Kind), &tsStr, &dataStr, &parentSeq); err != nil {
 			return nil, fmt.Errorf("sqlite: scan event: %w", err)
 		}
-		e.Timestamp, _ = time.Parse(time.RFC3339Nano, tsStr)
+		if e.Timestamp, err = time.Parse(time.RFC3339Nano, tsStr); err != nil {
+			return nil, fmt.Errorf("sqlite: parse event timestamp %q: %w", tsStr, err)
+		}
 		if dataStr != "" && dataStr != "{}" {
 			e.Data = json.RawMessage(dataStr)
 		}
@@ -273,19 +326,27 @@ func scanRun(row scanner) (*agent.Run, error) {
 		&r.ID, &r.AgentID, &r.Prompt, &status, &r.RunnerName, &r.Model,
 		&createdStr, &startedStr, &completedStr,
 		&r.Result, &r.Error, &r.CostUSD, &r.InputTokens, &r.OutputTokens, &r.DurationMS,
-		&r.ParentRunID,
+		&r.ParentRunID, &r.PID,
 	)
 	if err != nil {
 		return nil, err
 	}
 	r.Status = agent.RunStatus(status)
-	r.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdStr)
+	if r.CreatedAt, err = time.Parse(time.RFC3339Nano, createdStr); err != nil {
+		return nil, fmt.Errorf("sqlite: parse created_at %q: %w", createdStr, err)
+	}
 	if startedStr.Valid {
-		t, _ := time.Parse(time.RFC3339Nano, startedStr.String)
+		t, err := time.Parse(time.RFC3339Nano, startedStr.String)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite: parse started_at %q: %w", startedStr.String, err)
+		}
 		r.StartedAt = &t
 	}
 	if completedStr.Valid {
-		t, _ := time.Parse(time.RFC3339Nano, completedStr.String)
+		t, err := time.Parse(time.RFC3339Nano, completedStr.String)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite: parse completed_at %q: %w", completedStr.String, err)
+		}
 		r.CompletedAt = &t
 	}
 	return &r, nil
