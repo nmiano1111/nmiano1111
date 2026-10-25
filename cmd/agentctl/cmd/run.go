@@ -21,12 +21,13 @@ import (
 
 func newRunCmd() *cobra.Command {
 	var flags struct {
-		runner     string
-		model      string
-		agent      string
-		tools      []string
-		workDir    string
-		permMode   string
+		runner   string
+		model    string
+		agent    string
+		tools    []string
+		workDir  string
+		permMode string
+		isolate  bool
 	}
 
 	cmd := &cobra.Command{
@@ -44,7 +45,7 @@ Examples:
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			prompt := strings.Join(args, " ")
-			return runExecute(cmd.Context(), prompt, flags.runner, flags.model, flags.agent, flags.tools, flags.workDir, flags.permMode)
+			return runExecute(cmd.Context(), prompt, flags.runner, flags.model, flags.agent, flags.tools, flags.workDir, flags.permMode, flags.isolate)
 		},
 	}
 
@@ -54,11 +55,12 @@ Examples:
 	cmd.Flags().StringSliceVar(&flags.tools, "tools", nil, "allowed tool names (comma-separated)")
 	cmd.Flags().StringVar(&flags.workDir, "workdir", "", "working directory for tool execution")
 	cmd.Flags().StringVar(&flags.permMode, "permission-mode", "", "claude permission mode: acceptEdits|bypassPermissions|default|dontAsk (default: acceptEdits)")
+	cmd.Flags().BoolVar(&flags.isolate, "isolate", false, "fork a git worktree for filesystem isolation")
 
 	return cmd
 }
 
-func runExecute(ctx context.Context, prompt, runnerName, model, agentID string, tools []string, workDir, permMode string) error {
+func runExecute(ctx context.Context, prompt, runnerName, model, agentID string, tools []string, workDir, permMode string, isolate bool) error {
 	// Select runner.
 	var runner agent.Runner
 	switch runnerName {
@@ -93,10 +95,11 @@ func runExecute(ctx context.Context, prompt, runnerName, model, agentID string, 
 		AgentID: agentID,
 		Prompt:  prompt,
 		Config: agent.RunConfig{
-			Model:          model,
-			AllowedTools:   tools,
-			WorkDir:        workDir,
-			PermissionMode: permMode,
+			Model:           model,
+			AllowedTools:    tools,
+			WorkDir:         workDir,
+			PermissionMode:  permMode,
+			IsolateWorktree: isolate,
 		},
 	}
 

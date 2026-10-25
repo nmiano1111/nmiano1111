@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/nmiano/nickbot/internal/agent"
@@ -17,6 +18,8 @@ import (
 	_ "modernc.org/sqlite" // register sqlite driver
 )
 
+// schema creates tables and base indices. It must not reference columns added
+// by migrate(), because migrate() runs after schema on existing databases.
 const schema = `
 CREATE TABLE IF NOT EXISTS runs (
     id            TEXT PRIMARY KEY,
@@ -74,7 +77,35 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("sqlite: schema: %w", err)
 	}
-	return &Store{db: db}, nil
+	s := &Store{db: db}
+	if err := s.migrate(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("sqlite: migrate: %w", err)
+	}
+	return s, nil
+}
+
+// migrate applies schema additions for databases created before M2.
+// Each statement is idempotent: "duplicate column name" and "already exists"
+// errors from SQLite are silently ignored.
+func (s *Store) migrate() error {
+	stmts := []string{
+		`ALTER TABLE runs ADD COLUMN parent_run_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE events ADD COLUMN parent_seq INTEGER`,
+		// Partial index on parent_run_id — created after the column exists.
+		`CREATE INDEX IF NOT EXISTS idx_runs_parent ON runs(parent_run_id) WHERE parent_run_id != ''`,
+	}
+	for _, stmt := range stmts {
+		if _, err := s.db.Exec(stmt); err != nil {
+			msg := err.Error()
+			if strings.Contains(msg, "duplicate column name") ||
+				strings.Contains(msg, "already exists") {
+				continue
+			}
+			return fmt.Errorf("migrate: %w", err)
+		}
+	}
+	return nil
 }
 
 // Close implements store.Store.
@@ -88,11 +119,13 @@ func (s *Store) CreateRun(ctx context.Context, r *agent.Run) error {
 		INSERT INTO runs
 			(id, agent_id, prompt, status, runner_name, model,
 			 created_at, started_at, completed_at,
-			 result, error, cost_usd, input_tokens, output_tokens, duration_ms)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			 result, error, cost_usd, input_tokens, output_tokens, duration_ms,
+			 parent_run_id)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.AgentID, r.Prompt, string(r.Status), r.RunnerName, r.Model,
 		r.CreatedAt.UTC(), nullTime(r.StartedAt), nullTime(r.CompletedAt),
 		r.Result, r.Error, r.CostUSD, r.InputTokens, r.OutputTokens, r.DurationMS,
+		r.ParentRunID,
 	)
 	if err != nil {
 		return fmt.Errorf("sqlite: create run: %w", err)
@@ -106,11 +139,13 @@ func (s *Store) UpdateRun(ctx context.Context, r *agent.Run) error {
 		UPDATE runs SET
 			status=?, runner_name=?, model=?,
 			started_at=?, completed_at=?,
-			result=?, error=?, cost_usd=?, input_tokens=?, output_tokens=?, duration_ms=?
+			result=?, error=?, cost_usd=?, input_tokens=?, output_tokens=?, duration_ms=?,
+			parent_run_id=?
 		WHERE id=?`,
 		string(r.Status), r.RunnerName, r.Model,
 		nullTime(r.StartedAt), nullTime(r.CompletedAt),
 		r.Result, r.Error, r.CostUSD, r.InputTokens, r.OutputTokens, r.DurationMS,
+		r.ParentRunID,
 		r.ID,
 	)
 	if err != nil {
@@ -127,7 +162,8 @@ func (s *Store) GetRun(ctx context.Context, id string) (*agent.Run, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, agent_id, prompt, status, runner_name, model,
 		       created_at, started_at, completed_at,
-		       result, error, cost_usd, input_tokens, output_tokens, duration_ms
+		       result, error, cost_usd, input_tokens, output_tokens, duration_ms,
+		       parent_run_id
 		FROM runs WHERE id=?`, id)
 	r, err := scanRun(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -143,7 +179,8 @@ func (s *Store) GetRun(ctx context.Context, id string) (*agent.Run, error) {
 func (s *Store) ListRuns(ctx context.Context, limit int) ([]*agent.Run, error) {
 	q := `SELECT id, agent_id, prompt, status, runner_name, model,
 	             created_at, started_at, completed_at,
-	             result, error, cost_usd, input_tokens, output_tokens, duration_ms
+	             result, error, cost_usd, input_tokens, output_tokens, duration_ms,
+	             parent_run_id
 	      FROM runs ORDER BY created_at DESC`
 	var args []any
 	if limit > 0 {
@@ -175,9 +212,9 @@ func (s *Store) AppendEvent(ctx context.Context, e *agent.Event) error {
 		data = string(e.Data)
 	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT OR IGNORE INTO events (id, run_id, seq, kind, timestamp, data)
-		VALUES (?,?,?,?,?,?)`,
-		e.ID, e.RunID, e.Seq, string(e.Kind), e.Timestamp.UTC(), data,
+		INSERT OR IGNORE INTO events (id, run_id, seq, kind, timestamp, data, parent_seq)
+		VALUES (?,?,?,?,?,?,?)`,
+		e.ID, e.RunID, e.Seq, string(e.Kind), e.Timestamp.UTC(), data, nullInt(e.ParentSeq),
 	)
 	if err != nil {
 		return fmt.Errorf("sqlite: append event: %w", err)
@@ -188,7 +225,7 @@ func (s *Store) AppendEvent(ctx context.Context, e *agent.Event) error {
 // ListEvents implements store.Store.
 func (s *Store) ListEvents(ctx context.Context, runID string) ([]*agent.Event, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, run_id, seq, kind, timestamp, data
+		SELECT id, run_id, seq, kind, timestamp, data, parent_seq
 		FROM events WHERE run_id=? ORDER BY seq ASC`, runID)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: list events: %w", err)
@@ -197,16 +234,21 @@ func (s *Store) ListEvents(ctx context.Context, runID string) ([]*agent.Event, e
 	var events []*agent.Event
 	for rows.Next() {
 		var (
-			e        agent.Event
-			dataStr  string
-			tsStr    string
+			e          agent.Event
+			dataStr    string
+			tsStr      string
+			parentSeq  sql.NullInt64
 		)
-		if err := rows.Scan(&e.ID, &e.RunID, &e.Seq, (*string)(&e.Kind), &tsStr, &dataStr); err != nil {
+		if err := rows.Scan(&e.ID, &e.RunID, &e.Seq, (*string)(&e.Kind), &tsStr, &dataStr, &parentSeq); err != nil {
 			return nil, fmt.Errorf("sqlite: scan event: %w", err)
 		}
 		e.Timestamp, _ = time.Parse(time.RFC3339Nano, tsStr)
 		if dataStr != "" && dataStr != "{}" {
 			e.Data = json.RawMessage(dataStr)
+		}
+		if parentSeq.Valid {
+			n := int(parentSeq.Int64)
+			e.ParentSeq = &n
 		}
 		events = append(events, &e)
 	}
@@ -221,16 +263,17 @@ type scanner interface {
 
 func scanRun(row scanner) (*agent.Run, error) {
 	var (
-		r           agent.Run
-		status      string
-		createdStr  string
-		startedStr  sql.NullString
+		r            agent.Run
+		status       string
+		createdStr   string
+		startedStr   sql.NullString
 		completedStr sql.NullString
 	)
 	err := row.Scan(
 		&r.ID, &r.AgentID, &r.Prompt, &status, &r.RunnerName, &r.Model,
 		&createdStr, &startedStr, &completedStr,
 		&r.Result, &r.Error, &r.CostUSD, &r.InputTokens, &r.OutputTokens, &r.DurationMS,
+		&r.ParentRunID,
 	)
 	if err != nil {
 		return nil, err
@@ -253,4 +296,11 @@ func nullTime(t *time.Time) sql.NullString {
 		return sql.NullString{}
 	}
 	return sql.NullString{Valid: true, String: t.UTC().Format(time.RFC3339Nano)}
+}
+
+func nullInt(n *int) sql.NullInt64 {
+	if n == nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Valid: true, Int64: int64(*n)}
 }

@@ -35,7 +35,8 @@ type Event struct {
 	RunID     string          `json:"run_id"`
 	Kind      EventKind       `json:"kind"`
 	Timestamp time.Time       `json:"timestamp"`
-	Seq       int             `json:"seq"` // monotonic within a run
+	Seq       int             `json:"seq"`        // monotonic within a run
+	ParentSeq *int            `json:"parent_seq,omitempty"` // links tool_result → tool_use
 	Data      json.RawMessage `json:"data,omitempty"`
 }
 
@@ -106,6 +107,8 @@ type Run struct {
 	RunnerName string `json:"runner_name"`
 	// Model is the LLM model used, if applicable.
 	Model string `json:"model,omitempty"`
+	// ParentRunID is set when this run was spawned as a child of another run.
+	ParentRunID string `json:"parent_run_id,omitempty"`
 }
 
 // ── RunRequest ───────────────────────────────────────────────────────────────
@@ -120,6 +123,8 @@ type RunRequest struct {
 	Prompt string
 	// Config controls execution environment details.
 	Config RunConfig
+	// ParentRunID links this run as a child of another run.
+	ParentRunID string
 }
 
 // RunConfig configures the execution environment for a run.
@@ -137,4 +142,8 @@ type RunConfig struct {
 	// For the claude-code runner: acceptEdits | bypassPermissions | default | dontAsk
 	// Empty defaults to "acceptEdits" in non-interactive (--print) mode.
 	PermissionMode string
+	// IsolateWorktree, when true, forks a git worktree from WorkDir (or the
+	// current directory) before starting the runner. The agent works in the
+	// worktree; changes are isolated until explicitly merged.
+	IsolateWorktree bool
 }

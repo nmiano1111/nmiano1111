@@ -38,13 +38,12 @@ type Model struct {
 	// EventCh is the channel of incoming events.
 	EventCh <-chan agent.Event
 
-	spinner    spinner.Model
-	events     []renderedEvent
-	done       bool
-	finalRun   *agent.Run // run state after completion (nil until done)
-	width      int
-	height     int
-	startedAt  time.Time
+	spinner   spinner.Model
+	events    []renderedEvent
+	done      bool
+	width     int
+	height    int
+	startedAt time.Time
 }
 
 type renderedEvent struct {
@@ -132,7 +131,26 @@ func (m Model) View() string {
 	sb.WriteString(ui.HRule(w-2) + "\n\n")
 
 	// ── Meta ──────────────────────────────────────────────────────────────────
-	statusStr := m.statusLine()
+	ds := ui.DeriveDisplayStatus(m.Run)
+	if m.done {
+		// Re-derive from last event kind for accuracy.
+		for i := len(m.events) - 1; i >= 0; i-- {
+			if m.events[i].isErr {
+				ds = ui.DisplayFailed
+			} else if ds != ui.DisplayFailed {
+				ds = ui.DisplayCompleted
+			}
+			break
+		}
+	}
+	badge, badgeStyle := ui.DisplayStatusBadge(ds)
+	var statusStr string
+	if m.done {
+		statusStr = badgeStyle.Render(badge)
+	} else {
+		statusStr = m.spinner.View() + " " + ui.StyleAccent.Render("running")
+	}
+
 	field := func(k, v string) string {
 		return fmt.Sprintf("  %-12s %s", ui.StyleDim.Render(k), v)
 	}
@@ -185,19 +203,6 @@ func (m Model) FinalView() string {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-func (m Model) statusLine() string {
-	if m.done {
-		// Determine from last event.
-		for i := len(m.events) - 1; i >= 0; i-- {
-			if m.events[i].isErr {
-				return ui.StyleError.Render(ui.BadgeFailed)
-			}
-		}
-		return ui.StyleSuccess.Render(ui.BadgeCompleted)
-	}
-	return m.spinner.View() + " " + ui.StyleAccent.Render("running")
-}
-
 func waitEvent(ch <-chan agent.Event) tea.Cmd {
 	return func() tea.Msg {
 		e, ok := <-ch
@@ -206,6 +211,36 @@ func waitEvent(ch <-chan agent.Event) tea.Cmd {
 		}
 		return EventMsg(e)
 	}
+}
+
+// outputPattern maps a line prefix to a display style for text event content.
+type outputPattern struct {
+	prefix string
+	style  lipgloss.Style
+}
+
+// claudeCodePatterns highlights common Claude Code output prefixes in the TUI.
+var claudeCodePatterns = []outputPattern{
+	{"Reading ",  ui.StyleDim},
+	{"Writing ",  ui.StyleSuccess},
+	{"Editing ",  ui.StyleSuccess},
+	{"Creating ", ui.StyleSuccess},
+	{"Deleting ", ui.StyleWarning},
+	{"Running ",  ui.StyleAccent},
+	{"Bash(",     ui.StyleAccent},
+	{"Error:",    ui.StyleError},
+	{"✓ ",        ui.StyleSuccess},
+	{"✗ ",        ui.StyleError},
+}
+
+// applyOutputPattern returns the style for a text content line, based on prefix matching.
+func applyOutputPattern(s string) lipgloss.Style {
+	for _, p := range claudeCodePatterns {
+		if strings.HasPrefix(s, p.prefix) {
+			return p.style
+		}
+	}
+	return lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Dark: "#CDD6F4", Light: "#4C4F69"})
 }
 
 func renderEvent(e agent.Event) renderedEvent {
@@ -220,10 +255,16 @@ func renderEvent(e agent.Event) renderedEvent {
 		detail = string([]rune(detail)[:69]) + "…"
 	}
 
+	// Apply output pattern styling to text event details.
+	detailStyle := lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Dark: "#CDD6F4", Light: "#4C4F69"})
+	if e.Kind == agent.EventText {
+		detailStyle = applyOutputPattern(detail)
+	}
+
 	line := fmt.Sprintf("  %s  %s  %s",
 		ui.StyleDim.Render(ts),
 		display.Style.Render(display.Label),
-		lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Dark: "#CDD6F4", Light: "#4C4F69"}).Render(detail),
+		detailStyle.Render(detail),
 	)
 	return renderedEvent{
 		line:  line,

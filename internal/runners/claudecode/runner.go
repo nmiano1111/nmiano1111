@@ -76,8 +76,15 @@ func (r *Runner) Run(ctx context.Context, req agent.RunRequest) (<-chan agent.Ev
 		seq := 0
 		startTime := time.Now()
 		sentTerminal := false
-		emit := func(kind agent.EventKind, payload any) {
+		// toolUseSeqs maps tool_use_id → the seq of that tool_use event,
+		// so we can link tool_result events back to their originating tool_use.
+		toolUseSeqs := map[string]int{}
+
+		// emit sends an event to the channel and returns the event's seq.
+		emit := func(kind agent.EventKind, payload any, parentSeq *int) int {
+			thisSeq := seq
 			e := agent.MakeEvent(req.RunID, seq, kind, payload)
+			e.ParentSeq = parentSeq
 			seq++
 			select {
 			case ch <- e:
@@ -86,9 +93,10 @@ func (r *Runner) Run(ctx context.Context, req agent.RunRequest) (<-chan agent.Ev
 			if kind == agent.EventCompleted || kind == agent.EventFailed {
 				sentTerminal = true
 			}
+			return thisSeq
 		}
 
-		emit(agent.EventStarted, nil)
+		emit(agent.EventStarted, nil, nil)
 
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024) // 4 MB
@@ -106,9 +114,9 @@ func (r *Runner) Run(ctx context.Context, req agent.RunRequest) (<-chan agent.Ev
 
 			switch raw.Type {
 			case "assistant":
-				processAssistantMessage(raw.Message, emit)
+				processAssistantMessage(raw.Message, emit, toolUseSeqs)
 			case "user":
-				processUserMessage(raw.Message, emit)
+				processUserMessage(raw.Message, emit, toolUseSeqs)
 			case "result":
 				processResult(raw, startTime, emit)
 				sentTerminal = true
@@ -138,7 +146,7 @@ func (r *Runner) Run(ctx context.Context, req agent.RunRequest) (<-chan agent.Ev
 				errMsg = "claude exited without producing a result"
 			}
 		}
-		emit(agent.EventFailed, agent.FailedData{Error: errMsg})
+		emit(agent.EventFailed, agent.FailedData{Error: errMsg}, nil)
 	}()
 
 	return ch, nil
@@ -203,9 +211,13 @@ type ccUsage struct {
 	OutputTokens int `json:"output_tokens"`
 }
 
+// emitFn is the signature for the emit function passed to message processors.
+// It returns the seq assigned to the emitted event.
+type emitFn func(kind agent.EventKind, payload any, parentSeq *int) int
+
 // ── Message processors ────────────────────────────────────────────────────────
 
-func processAssistantMessage(raw json.RawMessage, emit func(agent.EventKind, any)) {
+func processAssistantMessage(raw json.RawMessage, emit emitFn, toolUseSeqs map[string]int) {
 	if len(raw) == 0 {
 		return
 	}
@@ -217,19 +229,21 @@ func processAssistantMessage(raw json.RawMessage, emit func(agent.EventKind, any
 		switch block.Type {
 		case "text":
 			if block.Text != "" {
-				emit(agent.EventText, agent.TextData{Content: block.Text})
+				emit(agent.EventText, agent.TextData{Content: block.Text}, nil)
 			}
 		case "tool_use":
-			emit(agent.EventToolUse, agent.ToolUseData{
+			data := agent.ToolUseData{
 				ToolID: block.ID,
 				Name:   block.Name,
 				Input:  block.Input,
-			})
+			}
+			usedSeq := emit(agent.EventToolUse, data, nil)
+			toolUseSeqs[block.ID] = usedSeq
 		}
 	}
 }
 
-func processUserMessage(raw json.RawMessage, emit func(agent.EventKind, any)) {
+func processUserMessage(raw json.RawMessage, emit emitFn, toolUseSeqs map[string]int) {
 	if len(raw) == 0 {
 		return
 	}
@@ -243,18 +257,23 @@ func processUserMessage(raw json.RawMessage, emit func(agent.EventKind, any)) {
 		}
 		// Content may be a string or an array; normalise to string.
 		content := rawContentToString(block.Content)
+		var parentSeq *int
+		if s, ok := toolUseSeqs[block.ToolUseID]; ok {
+			n := s
+			parentSeq = &n
+		}
 		emit(agent.EventToolResult, agent.ToolResultData{
 			ToolID:  block.ToolUseID,
 			Content: content,
 			IsError: block.IsError,
-		})
+		}, parentSeq)
 	}
 }
 
-func processResult(raw ccRawEvent, startTime time.Time, emit func(agent.EventKind, any)) {
+func processResult(raw ccRawEvent, startTime time.Time, emit emitFn) {
 	elapsed := time.Since(startTime)
 	if raw.IsError {
-		emit(agent.EventFailed, agent.FailedData{Error: raw.Result})
+		emit(agent.EventFailed, agent.FailedData{Error: raw.Result}, nil)
 		return
 	}
 	var inputTokens, outputTokens int
@@ -272,7 +291,7 @@ func processResult(raw ccRawEvent, startTime time.Time, emit func(agent.EventKin
 		InputTokens:  inputTokens,
 		OutputTokens: outputTokens,
 		DurationMS:   durationMS,
-	})
+	}, nil)
 }
 
 // rawContentToString converts a JSON content field to a plain string.

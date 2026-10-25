@@ -52,6 +52,7 @@ func init() {
 		newStatusCmd(),
 		newLogsCmd(),
 		newInspectCmd(),
+		newMCPCmd(),
 	)
 }
 

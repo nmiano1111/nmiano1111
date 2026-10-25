@@ -7,6 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -55,17 +59,40 @@ func (o *Orchestrator) Start(ctx context.Context, req agent.RunRequest) (*Execut
 		req.AgentID = o.runner.Name()
 	}
 
+	// Fork a git worktree for isolation if requested.
+	var worktreePath string
+	if req.Config.IsolateWorktree {
+		baseDir := req.Config.WorkDir
+		if baseDir == "" {
+			var err error
+			baseDir, err = os.Getwd()
+			if err != nil {
+				return nil, fmt.Errorf("orchestrator: get workdir: %w", err)
+			}
+		}
+		wt, err := forkWorktree(baseDir, req.RunID)
+		if err != nil {
+			return nil, fmt.Errorf("orchestrator: worktree: %w", err)
+		}
+		worktreePath = wt
+		req.Config.WorkDir = wt
+	}
+
 	// Persist the initial run record (status = pending).
 	run := &agent.Run{
-		ID:         req.RunID,
-		AgentID:    req.AgentID,
-		Prompt:     req.Prompt,
-		Status:     agent.RunStatusPending,
-		CreatedAt:  time.Now(),
-		RunnerName: o.runner.Name(),
-		Model:      req.Config.Model,
+		ID:          req.RunID,
+		AgentID:     req.AgentID,
+		Prompt:      req.Prompt,
+		Status:      agent.RunStatusPending,
+		CreatedAt:   time.Now(),
+		RunnerName:  o.runner.Name(),
+		Model:       req.Config.Model,
+		ParentRunID: req.ParentRunID,
 	}
 	if err := o.store.CreateRun(ctx, run); err != nil {
+		if worktreePath != "" {
+			removeWorktree(worktreePath)
+		}
 		return nil, fmt.Errorf("orchestrator: persist run: %w", err)
 	}
 
@@ -77,6 +104,9 @@ func (o *Orchestrator) Start(ctx context.Context, req agent.RunRequest) (*Execut
 		now := time.Now()
 		run.CompletedAt = &now
 		_ = o.store.UpdateRun(ctx, run)
+		if worktreePath != "" {
+			removeWorktree(worktreePath)
+		}
 		return nil, fmt.Errorf("orchestrator: start runner: %w", err)
 	}
 
@@ -111,6 +141,9 @@ func (o *Orchestrator) Start(ctx context.Context, req agent.RunRequest) (*Execut
 				o.log.Warn("failed to persist final run state",
 					slog.String("run_id", localRun.ID),
 					slog.Any("err", err))
+			}
+			if worktreePath != "" {
+				removeWorktree(worktreePath)
 			}
 			close(outCh)
 		}()
@@ -185,4 +218,30 @@ func applyFailed(run *agent.Run, e agent.Event) {
 	run.Status = agent.RunStatusFailed
 	now := e.Timestamp
 	run.CompletedAt = &now
+}
+
+// ── Worktree isolation ────────────────────────────────────────────────────────
+
+// forkWorktree creates a git worktree at a temp path derived from runID.
+// The worktree is a lightweight copy of baseDir's HEAD commit.
+func forkWorktree(baseDir, runID string) (string, error) {
+	// Find the git root of baseDir.
+	out, err := exec.Command("git", "-C", baseDir, "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return "", fmt.Errorf("not a git repository: %w", err)
+	}
+	gitRoot := strings.TrimSpace(string(out))
+
+	worktreePath := filepath.Join(os.TempDir(), "nickbot-worktrees", runID[:8])
+	cmd := exec.Command("git", "-C", gitRoot, "worktree", "add", "--detach", worktreePath, "HEAD")
+	if combined, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("git worktree add: %w\n%s", err, combined)
+	}
+	return worktreePath, nil
+}
+
+// removeWorktree removes a git worktree created by forkWorktree.
+func removeWorktree(path string) {
+	// --force handles the case where the worktree has uncommitted changes.
+	exec.Command("git", "worktree", "remove", "--force", path).Run() //nolint:errcheck
 }

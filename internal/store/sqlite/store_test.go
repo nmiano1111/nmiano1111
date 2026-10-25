@@ -285,3 +285,94 @@ func TestStore_OpenCreatesParentDirs(t *testing.T) {
 		t.Errorf("database file not created at %s", path)
 	}
 }
+
+func TestStore_ParentRunID(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	parent := &agent.Run{
+		ID: "parent-run", AgentID: "planner", Prompt: "plan it",
+		Status: agent.RunStatusCompleted, CreatedAt: time.Now(), RunnerName: "fake",
+	}
+	if err := s.CreateRun(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+
+	child := &agent.Run{
+		ID: "child-run", AgentID: "reviewer", Prompt: "review it",
+		Status:      agent.RunStatusPending,
+		CreatedAt:   time.Now(),
+		RunnerName:  "fake",
+		ParentRunID: "parent-run",
+	}
+	if err := s.CreateRun(ctx, child); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetRun(ctx, "child-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ParentRunID != "parent-run" {
+		t.Errorf("ParentRunID = %q, want %q", got.ParentRunID, "parent-run")
+	}
+}
+
+func TestStore_EventParentSeq(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	run := &agent.Run{
+		ID: "seq-run", AgentID: "a", Prompt: "p",
+		Status: agent.RunStatusRunning, CreatedAt: time.Now(), RunnerName: "fake",
+	}
+	s.CreateRun(ctx, run)
+
+	toolUseSeq := 1
+	events := []*agent.Event{
+		{ID: "e0", RunID: "seq-run", Kind: agent.EventStarted, Timestamp: time.Now(), Seq: 0},
+		{ID: "e1", RunID: "seq-run", Kind: agent.EventToolUse, Timestamp: time.Now(), Seq: 1},
+		{ID: "e2", RunID: "seq-run", Kind: agent.EventToolResult, Timestamp: time.Now(), Seq: 2,
+			ParentSeq: &toolUseSeq},
+	}
+	for _, e := range events {
+		if err := s.AppendEvent(ctx, e); err != nil {
+			t.Fatalf("AppendEvent(%s) = %v", e.ID, err)
+		}
+	}
+
+	got, err := s.ListEvents(ctx, "seq-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("len(events) = %d, want 3", len(got))
+	}
+	if got[0].ParentSeq != nil {
+		t.Error("started event should have nil ParentSeq")
+	}
+	if got[1].ParentSeq != nil {
+		t.Error("tool_use event should have nil ParentSeq")
+	}
+	if got[2].ParentSeq == nil || *got[2].ParentSeq != 1 {
+		t.Errorf("tool_result ParentSeq = %v, want &1", got[2].ParentSeq)
+	}
+}
+
+func TestStore_MigrateIdempotent(t *testing.T) {
+	// Open the same DB twice — migrations must not error on second open.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "migrate.db")
+
+	s1, err := sqlite.Open(path)
+	if err != nil {
+		t.Fatalf("first Open() = %v", err)
+	}
+	s1.Close()
+
+	s2, err := sqlite.Open(path)
+	if err != nil {
+		t.Fatalf("second Open() after migration = %v", err)
+	}
+	s2.Close()
+}
