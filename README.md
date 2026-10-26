@@ -6,6 +6,7 @@ A Go-first platform for running, tracking, and composing AI agents. It gives eve
 
 ## ✨ Features
 
+- **🌐 Web dashboard** — browse run history, inspect events, and watch live output in the browser ([docs](docs/web-dashboard.md))
 - **📺 Live TUI** — watch agent events stream in real time with a polished terminal UI
 - **💾 Persistent history** — every run is stored in a local SQLite database with full event logs
 - **⏱️ Timeouts & cancellation** — set a deadline or cancel any live run by ID
@@ -130,6 +131,25 @@ Sends `SIGTERM` to the runner subprocess and marks the run as `cancelled`.
 
 ---
 
+### `agentctl web` — start the web dashboard
+
+```bash
+agentctl web [--port 7545] [--host localhost]
+```
+
+Starts a REST API server. Point a browser at the frontend to get the full dashboard UI — see **[docs/web-dashboard.md](docs/web-dashboard.md)** for screenshots and full API reference.
+
+```bash
+# Terminal 1: API server
+agentctl web
+
+# Terminal 2: frontend dev server
+cd web && npm run dev
+# → open http://localhost:5173
+```
+
+---
+
 ### `agentctl mcp` — start the MCP server
 
 ```bash
@@ -165,6 +185,7 @@ cmd/agentctl/          CLI binary (Cobra)
   cmd/logs.go          agentctl logs
   cmd/cancel.go        agentctl cancel
   cmd/mcp.go           agentctl mcp
+  cmd/web.go           agentctl web
 
 internal/
   agent/               Core types: Event, Run, RunRequest, Runner interface
@@ -175,6 +196,13 @@ internal/
   verifier/            Post-run shell command validation
   ui/                  Lipgloss styles, formatters, Bubble Tea TUI
   mcp/                 MCP JSON-RPC stdio server
+  api/                 HTTP REST API (runs, events, SSE streaming)
+
+web/                   React + TypeScript frontend (Vite + Tailwind)
+  src/pages/           Overview, Runs list, Run detail
+  src/components/      Shared UI, event log, event graph (React Flow)
+  src/api/             Typed fetch client + SSE helper
+  src/lib/             TanStack Query hooks, utilities
 ```
 
 ---
