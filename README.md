@@ -18,6 +18,25 @@ A Go-first platform for running, tracking, and composing AI agents. It gives eve
 
 ---
 
+## 🌐 Web Dashboard
+
+![Overview dashboard](docs/screenshots/overview.png)
+
+nickbot ships a built-in web dashboard for browsing run history, inspecting individual runs, and watching live agent output.
+
+```bash
+# Start the API server
+agentctl web
+
+# In a second terminal, start the frontend
+cd web && npm run dev
+# → open http://localhost:5173
+```
+
+→ **[Full dashboard documentation with screenshots](docs/web-dashboard.md)**
+
+---
+
 ## 🚀 Quick Start
 
 ### Build
