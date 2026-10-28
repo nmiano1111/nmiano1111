@@ -1,11 +1,16 @@
-import { useMemo } from 'react'
+import { useMemo, useEffect } from 'react'
 import {
   ReactFlow,
+  ReactFlowProvider,
   Background,
   Controls,
   MiniMap,
+  Handle,
+  Position,
+  MarkerType,
   useNodesState,
   useEdgesState,
+  useReactFlow,
   type Node,
   type Edge,
   type NodeTypes,
@@ -13,147 +18,324 @@ import {
 } from '@xyflow/react'
 import dagre from 'dagre'
 import '@xyflow/react/dist/style.css'
-import { cn, EVENT_CONFIG } from '@/lib/utils'
+import { cn } from '@/lib/utils'
 import type { AgentEvent } from '@/api/types'
 
-// Custom node component for events
-function EventNode({ data }: { data: { label: string; kind: string; detail: string; isTerminal: boolean } }) {
-  const cfg = EVENT_CONFIG[data.kind as keyof typeof EVENT_CONFIG] ?? {
-    label: data.kind,
-    icon: '·',
-    color: 'text-text-dim',
+// ── High-level step model ─────────────────────────────────────────────────────
+
+type StepKind = 'reasoning' | 'tool_cluster' | 'completed' | 'failed' | 'verification'
+
+interface ToolEntry {
+  name: string
+  count: number
+  errorCount: number
+}
+
+interface Step {
+  id: string
+  kind: StepKind
+  label: string          // primary text
+  sublabel?: string      // secondary / command text
+  // tool_cluster only
+  tools?: ToolEntry[]    // per-tool breakdown
+  totalCalls?: number
+  totalErrors?: number
+  // reasoning only
+  textCount?: number
+  // terminal / verify
+  isError?: boolean
+}
+
+
+function computeSteps(events: AgentEvent[]): Step[] {
+  // Map tool_use seq → its tool_result event
+  const resultByUseSeq = new Map<number, AgentEvent>()
+  for (const e of events) {
+    if (e.kind === 'tool_result' && e.parent_seq != null) {
+      resultByUseSeq.set(e.parent_seq, e)
+    }
+  }
+  const absorbedSeqs = new Set<number>()
+  for (const e of resultByUseSeq.values()) absorbedSeqs.add(e.seq)
+
+  const steps: Step[] = []
+  let pendingText: AgentEvent[] = []
+  // Accumulate consecutive tool_use events into a cluster
+  let pendingTools: Array<{ name: string; isError: boolean }> = []
+  let idx = 0
+
+  const flushText = () => {
+    if (pendingText.length === 0) return
+    const first = (pendingText[0].data ?? {}) as Record<string, unknown>
+    const content = String(first.content ?? '').replace(/\n/g, ' ').trim()
+    const label =
+      pendingText.length > 1
+        ? `Reasoning · ${pendingText.length} messages`
+        : content.slice(0, 70) || 'Reasoning'
+    steps.push({ id: `reasoning-${idx++}`, kind: 'reasoning', label, textCount: pendingText.length })
+    pendingText = []
   }
 
-  return (
-    <div
-      className={cn(
-        'px-3 py-2 rounded border text-xs min-w-[130px] max-w-[200px]',
-        'bg-base-200 border-base-300',
-        data.kind === 'completed' && 'border-green/40 bg-green/5',
-        data.kind === 'failed' && 'border-red/40 bg-red/5',
-        data.kind === 'tool_use' && 'border-mauve/40 bg-mauve/5',
-        data.kind === 'tool_result' && 'border-peach/40 bg-peach/5',
-        data.kind === 'started' && 'border-accent/40 bg-accent/5',
-        data.kind === 'verification' && 'border-sky/40 bg-sky/5',
-      )}
-    >
-      <div className={cn('font-medium mb-0.5', cfg.color)}>
-        {cfg.icon} {cfg.label}
-      </div>
-      {data.detail && (
-        <div className="text-text-dim truncate" style={{ maxWidth: 160 }}>
-          {data.detail}
+  const flushTools = () => {
+    if (pendingTools.length === 0) return
+    // Count per tool name, preserving first-seen order
+    const byName = new Map<string, ToolEntry>()
+    for (const t of pendingTools) {
+      const entry = byName.get(t.name) ?? { name: t.name, count: 0, errorCount: 0 }
+      entry.count++
+      if (t.isError) entry.errorCount++
+      byName.set(t.name, entry)
+    }
+    const tools = Array.from(byName.values())
+    const totalErrors = pendingTools.filter((t) => t.isError).length
+    const n = pendingTools.length
+    steps.push({
+      id: `tools-${idx++}`,
+      kind: 'tool_cluster',
+      label: `${n} tool call${n > 1 ? 's' : ''}`,
+      tools,
+      totalCalls: n,
+      totalErrors,
+    })
+    pendingTools = []
+  }
+
+  for (const e of events) {
+    if (absorbedSeqs.has(e.seq)) continue
+    if (e.kind === 'started') continue
+
+    if (e.kind === 'text') {
+      flushTools()
+      pendingText.push(e)
+      continue
+    }
+
+    if (e.kind === 'tool_use') {
+      flushText()
+      const rd = resultByUseSeq.get(e.seq)
+      const rdData = rd ? (rd.data ?? {}) as Record<string, unknown> : null
+      const d = (e.data ?? {}) as Record<string, unknown>
+      pendingTools.push({
+        name: String(d.name ?? 'tool'),
+        isError: rdData ? Boolean(rdData.is_error) : false,
+      })
+      continue
+    }
+
+    // Non-tool, non-text event — flush both accumulators first
+    flushTools()
+    flushText()
+
+    const d = (e.data ?? {}) as Record<string, unknown>
+
+    if (e.kind === 'completed') {
+      steps.push({
+        id: `completed-${e.seq}`,
+        kind: 'completed',
+        label: String(d.result ?? '').slice(0, 100).replace(/\n/g, ' ').trim() || 'Done',
+      })
+    } else if (e.kind === 'failed') {
+      steps.push({
+        id: `failed-${e.seq}`,
+        kind: 'failed',
+        label: String(d.error ?? 'Failed').slice(0, 100).replace(/\n/g, ' ').trim(),
+        isError: true,
+      })
+    } else if (e.kind === 'verification') {
+      const passed = Boolean(d.passed)
+      steps.push({
+        id: `verification-${e.seq}`,
+        kind: 'verification',
+        label: passed ? 'Verified' : 'Verify failed',
+        sublabel: String(d.command ?? '').slice(0, 60),
+        isError: !passed,
+      })
+    }
+    idx++
+  }
+
+  flushTools()
+  flushText()
+  return steps
+}
+
+// ── Node component ────────────────────────────────────────────────────────────
+
+interface StepNodeData extends Record<string, unknown> {
+  step: Step
+}
+
+function StepNode({ data }: { data: StepNodeData }) {
+  const { step } = data
+  const handle = (type: 'source' | 'target', pos: Position) => (
+    <Handle type={type} position={pos}
+      style={{ background: '#585b70', width: 6, height: 6, border: 'none' }} />
+  )
+
+  if (step.kind === 'tool_cluster') {
+    const hasErrors = (step.totalErrors ?? 0) > 0
+    return (
+      <div className="rounded border bg-mauve/5 border-mauve/30 min-w-[180px] max-w-[260px] select-none">
+        {handle('target', Position.Left)}
+        <div className="px-3 pt-2 pb-2">
+          <div className="text-[10px] font-semibold uppercase tracking-wider text-mauve/60 mb-1.5">
+            ⚡ {step.totalCalls} Tool Call{step.totalCalls !== 1 ? 's' : ''}
+          </div>
+          <div className="flex flex-wrap gap-x-3 gap-y-0.5">
+            {step.tools?.map((t) => (
+              <span key={t.name}
+                className={cn('text-[11px]', t.errorCount > 0 ? 'text-red/80' : 'text-text-dim')}
+              >
+                {t.name}{t.count > 1 ? <span className="text-text-dim/60"> ×{t.count}</span> : null}
+              </span>
+            ))}
+          </div>
+          {hasErrors && (
+            <div className="text-[10px] text-red/60 mt-1.5">
+              {step.totalErrors} error{step.totalErrors !== 1 ? 's' : ''}
+            </div>
+          )}
         </div>
-      )}
+        {handle('source', Position.Right)}
+      </div>
+    )
+  }
+
+  if (step.kind === 'reasoning') {
+    return (
+      <div className="rounded border bg-base-100/50 border-base-300/50 min-w-[160px] max-w-[240px] select-none">
+        {handle('target', Position.Left)}
+        <div className="px-3 py-2">
+          <div className="text-[10px] font-semibold uppercase tracking-wider text-text-dim/50 mb-1">
+            💭 Reasoning
+          </div>
+          <div className="text-[11px] text-text-dim leading-snug" style={{ maxWidth: 210 }}>
+            {step.label}
+          </div>
+        </div>
+        {handle('source', Position.Right)}
+      </div>
+    )
+  }
+
+  // completed / failed / verification
+  const terminalStyle: Record<string, { border: string; bg: string; icon: string; color: string }> = {
+    completed:    { border: 'border-green/40',  bg: 'bg-green/5',  icon: '✓', color: 'text-green' },
+    failed:       { border: 'border-red/40',    bg: 'bg-red/5',    icon: '✗', color: 'text-red' },
+    verification: {
+      border: step.isError ? 'border-red/30' : 'border-sky/30',
+      bg:     step.isError ? 'bg-red/5'      : 'bg-sky/5',
+      icon:   step.isError ? '✗'             : '✓',
+      color:  step.isError ? 'text-red'      : 'text-sky',
+    },
+  }
+  const ts = terminalStyle[step.kind] ?? terminalStyle.completed
+
+  return (
+    <div className={cn('rounded border min-w-[160px] max-w-[240px] select-none', ts.border, ts.bg)}>
+      {handle('target', Position.Left)}
+      <div className="px-3 py-2">
+        <div className={cn('text-[10px] font-semibold uppercase tracking-wider mb-1 opacity-70', ts.color)}>
+          {ts.icon} {step.kind === 'verification' ? 'Verify' : step.kind === 'completed' ? 'Done' : 'Failed'}
+        </div>
+        <div className={cn('text-[11px] leading-snug', ts.color)} style={{ maxWidth: 210 }}>
+          {step.label}
+        </div>
+        {step.sublabel && (
+          <div className="text-[10px] text-text-dim font-mono mt-0.5 truncate" style={{ maxWidth: 210 }}>
+            {step.sublabel}
+          </div>
+        )}
+      </div>
+      {handle('source', Position.Right)}
     </div>
   )
 }
 
-const nodeTypes: NodeTypes = {
-  event: EventNode,
-}
+const nodeTypes: NodeTypes = { step: StepNode }
 
-function getEventDetail(event: AgentEvent): string {
-  const d = (event.data ?? {}) as Record<string, unknown>
-  switch (event.kind) {
-    case 'text': {
-      const content = String(d.content ?? '').replace(/\n/g, ' ').trim()
-      return content.length > 40 ? content.slice(0, 38) + '…' : content
-    }
-    case 'tool_use':
-      return String(d.name ?? '')
-    case 'tool_result':
-      return d.is_error ? '[error]' : String(d.content ?? '').slice(0, 40).replace(/\n/g, ' ').trim()
-    case 'completed':
-      return String(d.result ?? '').slice(0, 40) || 'done'
-    case 'failed':
-      return String(d.error ?? '').slice(0, 40)
-    case 'verification':
-      return (d.passed ? '✓ ' : '✗ ') + String(d.command ?? '')
-    case 'started':
-      return `pid ${d.pid ?? '?'}`
-    default:
-      return ''
+// ── Graph builder ─────────────────────────────────────────────────────────────
+
+const NODE_W = 260
+// Heights vary by kind — tell dagre the real rendered size so it doesn't overlap nodes
+function nodeHeight(step: Step): number {
+  if (step.kind === 'tool_cluster') {
+    const rows = Math.ceil((step.tools?.length ?? 0) / 3) // ~3 tool names per row
+    return 52 + rows * 16 + (step.totalErrors ? 16 : 0)
   }
+  return 58
 }
 
 function buildGraph(events: AgentEvent[]): { nodes: Node[]; edges: Edge[] } {
-  if (events.length === 0) return { nodes: [], edges: [] }
+  const steps = computeSteps(events)
+  if (steps.length === 0) return { nodes: [], edges: [] }
 
-  // Build nodes
-  const nodes: Node[] = events.map((event) => ({
-    id: String(event.seq),
-    type: 'event',
-    position: { x: 0, y: 0 }, // Dagre will set positions
-    data: {
-      label: event.kind,
-      kind: event.kind,
-      detail: getEventDetail(event),
-      isTerminal: event.kind === 'completed' || event.kind === 'failed',
-    },
+  const nodes: Node[] = steps.map((step): Node => ({
+    id: step.id,
+    type: 'step',
+    position: { x: 0, y: 0 },
+    data: { step } satisfies StepNodeData,
   }))
 
-  // Build edges: sequential + parent_seq links
   const edges: Edge[] = []
-  for (let i = 1; i < events.length; i++) {
-    const prev = events[i - 1]
-    const curr = events[i]
-    // Sequential edge
+  for (let i = 1; i < steps.length; i++) {
+    const prev = steps[i - 1]
+    const curr = steps[i]
+    const isDim = prev.kind === 'reasoning' || curr.kind === 'reasoning'
     edges.push({
-      id: `seq-${prev.seq}-${curr.seq}`,
-      source: String(prev.seq),
-      target: String(curr.seq),
-      style: { stroke: '#45475a', strokeWidth: 1.5 },
-      animated: false,
+      id: `e-${i}`,
+      source: prev.id,
+      target: curr.id,
+      style: {
+        stroke: isDim ? '#45475a' : '#585b70',
+        strokeWidth: 1.5,
+        strokeDasharray: isDim ? '4 3' : undefined,
+      },
+      markerEnd: { type: MarkerType.ArrowClosed, color: '#585b70', width: 13, height: 13 },
     })
-    // Parent link (tool_use → tool_result)
-    if (curr.parent_seq !== null && curr.parent_seq !== undefined) {
-      edges.push({
-        id: `parent-${curr.parent_seq}-${curr.seq}`,
-        source: String(curr.parent_seq),
-        target: String(curr.seq),
-        style: { stroke: '#cba6f7', strokeWidth: 1, strokeDasharray: '4 2' },
-        label: 'result',
-        labelStyle: { fill: '#6c7086', fontSize: 9 },
-      })
-    }
   }
 
-  // Auto-layout with Dagre
   const g = new dagre.graphlib.Graph()
   g.setDefaultEdgeLabel(() => ({}))
-  g.setGraph({ rankdir: 'LR', ranksep: 60, nodesep: 20 })
+  g.setGraph({ rankdir: 'LR', ranksep: 80, nodesep: 40 })
 
   nodes.forEach((node) => {
-    g.setNode(node.id, { width: 200, height: 52 })
+    const step = (node.data as StepNodeData).step
+    g.setNode(node.id, { width: NODE_W, height: nodeHeight(step) })
   })
-  edges.forEach((edge) => {
-    g.setEdge(edge.source, edge.target)
-  })
-
+  edges.forEach((e) => g.setEdge(e.source, e.target))
   dagre.layout(g)
 
   const positioned = nodes.map((node) => {
     const { x, y } = g.node(node.id)
-    return { ...node, position: { x: x - 100, y: y - 26 } }
+    const step = (node.data as StepNodeData).step
+    const h = nodeHeight(step)
+    return { ...node, position: { x: x - NODE_W / 2, y: y - h / 2 } }
   })
 
   return { nodes: positioned, edges }
 }
+
+// ── Component ─────────────────────────────────────────────────────────────────
 
 interface EventGraphProps {
   events: AgentEvent[]
   className?: string
 }
 
-export function EventGraph({ events, className }: EventGraphProps) {
-  const { nodes: initialNodes, edges: initialEdges } = useMemo(
-    () => buildGraph(events),
-    [events]
-  )
+function EventGraphInner({ events, className }: EventGraphProps) {
+  const { fitView } = useReactFlow()
+  const [nodes, setNodes, onNodesChange] = useNodesState<Node>([])
+  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([])
 
-  const [nodes, , onNodesChange] = useNodesState(initialNodes)
-  const [edges, , onEdgesChange] = useEdgesState(initialEdges)
+  const graphData = useMemo(() => buildGraph(events), [events])
+
+  useEffect(() => {
+    setNodes(graphData.nodes)
+    setEdges(graphData.edges)
+    // fitView after React has committed the new nodes to the DOM.
+    requestAnimationFrame(() => fitView({ padding: 0.25, duration: 200 }))
+  }, [graphData, setNodes, setEdges, fitView])
 
   if (events.length === 0) {
     return (
@@ -171,40 +353,32 @@ export function EventGraph({ events, className }: EventGraphProps) {
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         nodeTypes={nodeTypes}
-        fitView
-        fitViewOptions={{ padding: 0.2 }}
-        minZoom={0.3}
+        minZoom={0.2}
         maxZoom={2}
         proOptions={{ hideAttribution: true }}
       >
-        <Background
-          color="#313244"
-          gap={20}
-          variant={BackgroundVariant.Dots}
-          size={1}
-        />
-        <Controls
-          style={{
-            background: '#1e1e2e',
-            border: '1px solid #313244',
-            borderRadius: 6,
-          }}
-        />
+        <Background color="#313244" gap={20} variant={BackgroundVariant.Dots} size={1} />
+        <Controls style={{ background: '#1e1e2e', border: '1px solid #313244', borderRadius: 6 }} />
         <MiniMap
-          style={{
-            background: '#181825',
-            border: '1px solid #313244',
-          }}
+          style={{ background: '#181825', border: '1px solid #313244' }}
           nodeColor={(node) => {
-            const kind = (node.data as { kind: string }).kind
-            if (kind === 'completed') return '#a6e3a1'
-            if (kind === 'failed') return '#f38ba8'
-            if (kind === 'tool_use') return '#cba6f7'
-            if (kind === 'tool_result') return '#fab387'
+            const kind = ((node.data as StepNodeData).step ?? {}).kind
+            if (kind === 'completed')    return '#a6e3a1'
+            if (kind === 'failed')       return '#f38ba8'
+            if (kind === 'tool_cluster') return '#cba6f7'
+            if (kind === 'verification') return '#89dceb'
             return '#45475a'
           }}
         />
       </ReactFlow>
     </div>
+  )
+}
+
+export function EventGraph(props: EventGraphProps) {
+  return (
+    <ReactFlowProvider>
+      <EventGraphInner {...props} />
+    </ReactFlowProvider>
   )
 }
