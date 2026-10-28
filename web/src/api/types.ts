@@ -20,7 +20,21 @@ export interface Run {
   runner_name: string
   model: string
   parent_run_id: string
+  job_id: string
   pid: number
+}
+
+export interface JobSummary extends Run {
+  run_count: number
+  total_cost: number
+}
+
+export interface JobDetail extends JobSummary {
+  runs: Run[]
+}
+
+export interface ListJobsResponse {
+  jobs: JobSummary[]
 }
 
 export type EventKind =

@@ -10,7 +10,7 @@ import {
   type SortingState,
   type ColumnFiltersState,
 } from '@tanstack/react-table'
-import { ArrowUpDown, ArrowUp, ArrowDown, RefreshCw, Search, X } from 'lucide-react'
+import { ArrowUpDown, ArrowUp, ArrowDown, RefreshCw, Search, X, GitBranch } from 'lucide-react'
 import { useRuns } from '@/lib/hooks'
 import { StatusBadge } from '@/components/ui/StatusBadge'
 import { PageHeader } from '@/components/ui/PageHeader'
@@ -26,7 +26,12 @@ import {
 } from '@/lib/utils'
 import type { Run, RunStatus } from '@/api/types'
 
-const col = createColumnHelper<Run>()
+interface JobRow extends Run {
+  subtaskCount: number
+  totalCost: number
+}
+
+const col = createColumnHelper<JobRow>()
 
 const STATUS_OPTIONS: { value: RunStatus | 'all'; label: string }[] = [
   { value: 'all', label: 'All statuses' },
@@ -39,7 +44,7 @@ const STATUS_OPTIONS: { value: RunStatus | 'all'; label: string }[] = [
 
 export function RunsPage() {
   const navigate = useNavigate()
-  const { data: runs = [], isLoading, error, refetch, isFetching } = useRuns(100)
+  const { data: runs = [], isLoading, error, refetch, isFetching } = useRuns(200)
 
   const [sorting, setSorting] = useState<SortingState>([
     { id: 'created_at', desc: true },
@@ -48,23 +53,52 @@ export function RunsPage() {
   const [globalFilter, setGlobalFilter] = useState('')
   const [statusFilter, setStatusFilter] = useState<RunStatus | 'all'>('all')
 
-  // Apply status filter on top of the table filter
-  const filteredData = useMemo(() => {
-    if (statusFilter === 'all') return runs
-    return runs.filter((r) => r.status === statusFilter)
-  }, [runs, statusFilter])
+  // Build child map and compute per-root tree stats
+  const jobs = useMemo((): JobRow[] => {
+    // Map parentId -> list of direct children
+    const childMap = new Map<string, Run[]>()
+    for (const run of runs) {
+      const pid = run.parent_run_id || ''
+      if (!childMap.has(pid)) childMap.set(pid, [])
+      childMap.get(pid)!.push(run)
+    }
+
+    // Walk the tree rooted at `id`, return { count, cost } of all descendants
+    function descStats(id: string): { count: number; cost: number } {
+      const children = childMap.get(id) ?? []
+      let count = children.length
+      let cost = children.reduce((s, c) => s + c.cost_usd, 0)
+      for (const child of children) {
+        const sub = descStats(child.id)
+        count += sub.count
+        cost += sub.cost
+      }
+      return { count, cost }
+    }
+
+    // Only show root runs (no parent)
+    return runs
+      .filter((r) => !r.parent_run_id)
+      .map((r) => {
+        const { count, cost } = descStats(r.id)
+        return { ...r, subtaskCount: count, totalCost: r.cost_usd + cost }
+      })
+  }, [runs])
+
+  const filteredJobs = useMemo(() => {
+    if (statusFilter === 'all') return jobs
+    return jobs.filter((j) => j.status === statusFilter)
+  }, [jobs, statusFilter])
 
   const columns = useMemo(
     () => [
       col.accessor('status', {
         header: 'Status',
-        cell: (info) => (
-          <StatusBadge status={info.getValue()} pulse />
-        ),
+        cell: (info) => <StatusBadge status={info.getValue()} pulse />,
         enableSorting: false,
       }),
       col.accessor('id', {
-        header: 'Run ID',
+        header: 'ID',
         cell: (info) => (
           <span className="font-mono text-accent text-xs font-medium">
             {shortId(info.getValue())}
@@ -75,15 +109,9 @@ export function RunsPage() {
       col.accessor('agent_id', {
         header: 'Agent',
         cell: (info) => (
-          <span className="text-xs text-text-subtle truncate max-w-[120px] block">
+          <span className="text-xs text-text-dim truncate max-w-[120px] block">
             {info.getValue() || '—'}
           </span>
-        ),
-      }),
-      col.accessor('runner_name', {
-        header: 'Runner',
-        cell: (info) => (
-          <span className="text-xs text-text-dim">{info.getValue() || '—'}</span>
         ),
       }),
       col.accessor('prompt', {
@@ -91,13 +119,29 @@ export function RunsPage() {
         cell: (info) => {
           const val = info.getValue()
           return (
-            <span className="text-sm text-text truncate max-w-[340px] block" title={val}>
+            <span
+              className="text-sm text-text truncate max-w-[340px] block"
+              title={val}
+            >
               {val.length > 80 ? val.slice(0, 78) + '…' : val}
             </span>
           )
         },
       }),
-      col.accessor('cost_usd', {
+      col.accessor('subtaskCount', {
+        header: 'Subtasks',
+        cell: (info) => {
+          const count = info.getValue()
+          if (!count) return <span className="text-xs text-text-dim">—</span>
+          return (
+            <span className="inline-flex items-center gap-1 text-xs text-text-dim">
+              <GitBranch size={10} />
+              {count}
+            </span>
+          )
+        },
+      }),
+      col.accessor('totalCost', {
         header: 'Cost',
         cell: (info) => (
           <span className="text-xs text-text-dim font-mono">
@@ -127,7 +171,7 @@ export function RunsPage() {
   )
 
   const table = useReactTable({
-    data: filteredData,
+    data: filteredJobs,
     columns,
     state: { sorting, columnFilters, globalFilter },
     onSortingChange: setSorting,
@@ -150,17 +194,16 @@ export function RunsPage() {
     )
   }
 
-  const totalRuns = runs.length
-  const runningCount = runs.filter((r) => r.status === 'running').length
+  const runningCount = jobs.filter((j) => j.status === 'running').length
 
   return (
     <div className="flex flex-col h-full">
       <PageHeader
-        title="Runs"
+        title="Jobs"
         subtitle={
           runningCount > 0
             ? `${runningCount} running`
-            : `${totalRuns} total`
+            : `${jobs.length} total`
         }
         actions={
           <Button
@@ -177,7 +220,6 @@ export function RunsPage() {
 
       {/* Filters */}
       <div className="flex items-center gap-3 px-6 py-3 border-b border-base-300 bg-base-100/30">
-        {/* Search */}
         <div className="relative flex-1 max-w-xs">
           <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-text-dim" />
           <input
@@ -200,7 +242,6 @@ export function RunsPage() {
           )}
         </div>
 
-        {/* Status filter */}
         <select
           value={statusFilter}
           onChange={(e) => setStatusFilter(e.target.value as RunStatus | 'all')}
@@ -217,7 +258,7 @@ export function RunsPage() {
         </select>
 
         <span className="text-xs text-text-dim ml-auto">
-          {table.getFilteredRowModel().rows.length} of {totalRuns}
+          {table.getFilteredRowModel().rows.length} of {jobs.length}
         </span>
       </div>
 
@@ -226,11 +267,11 @@ export function RunsPage() {
         {table.getFilteredRowModel().rows.length === 0 ? (
           <EmptyState
             icon="◦"
-            title="No runs found"
+            title="No jobs found"
             description={
-              totalRuns === 0
+              jobs.length === 0
                 ? 'Start a run from the CLI: agentctl run "your prompt"'
-                : 'No runs match your filters.'
+                : 'No jobs match your filters.'
             }
           />
         ) : (
@@ -249,10 +290,7 @@ export function RunsPage() {
                       onClick={header.column.getToggleSortingHandler()}
                     >
                       <div className="flex items-center gap-1">
-                        {flexRender(
-                          header.column.columnDef.header,
-                          header.getContext()
-                        )}
+                        {flexRender(header.column.columnDef.header, header.getContext())}
                         {header.column.getCanSort() && (
                           <span className="text-text-dim">
                             {header.column.getIsSorted() === 'asc' ? (
@@ -271,23 +309,29 @@ export function RunsPage() {
               ))}
             </thead>
             <tbody className="divide-y divide-base-300/50">
-              {table.getRowModel().rows.map((row) => (
-                <tr
-                  key={row.id}
-                  onClick={() => navigate(`/runs/${row.original.id}`)}
-                  className={cn(
-                    'cursor-pointer transition-colors',
-                    'hover:bg-base-300/30',
-                    row.original.status === 'running' && 'bg-accent/5'
-                  )}
-                >
-                  {row.getVisibleCells().map((cell) => (
-                    <td key={cell.id} className="px-4 py-2.5">
-                      {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                    </td>
-                  ))}
-                </tr>
-              ))}
+              {table.getRowModel().rows.map((row) => {
+                const job = row.original
+                const dest = job.subtaskCount > 0
+                  ? `/runs/${job.id}/tree`
+                  : `/runs/${job.id}`
+                return (
+                  <tr
+                    key={row.id}
+                    onClick={() => navigate(dest)}
+                    className={cn(
+                      'cursor-pointer transition-colors',
+                      'hover:bg-base-300/30',
+                      job.status === 'running' && 'bg-accent/5'
+                    )}
+                  >
+                    {row.getVisibleCells().map((cell) => (
+                      <td key={cell.id} className="px-4 py-2.5">
+                        {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                      </td>
+                    ))}
+                  </tr>
+                )
+              })}
             </tbody>
           </table>
         )}

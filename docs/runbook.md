@@ -512,6 +512,133 @@ Every run is also browsable as an MCP resource at `nickbot://runs/<run-id>`. Hos
 
 ---
 
+## 10. Complex DAG workflows
+
+Most `agentctl run` invocations form a linear chain: plan → execute → verify.
+For tasks that naturally decompose into parallel branches followed by a
+synthesis step, you can wire the runs together in a shell script using the
+`--json` flag and `jq`.
+
+### DAG shape
+
+```
+         ┌─ [A] analyse-backend ─┐
+[0] plan ┤                        ├─ [B] synthesise ─ [C] verify
+         └─ [A] analyse-frontend ─┘
+```
+
+Steps A run in **parallel**.  Step B starts only when both finish.
+Step C is conditional — it only runs if step B succeeded.
+
+### Template
+
+```bash
+#!/usr/bin/env bash
+# dag-template.sh — Parallel fan-out → conditional fan-in
+set -euo pipefail
+
+DB="${NICKBOT_DB:-$HOME/.nickbot/nickbot.db}"
+RUNNER="${RUNNER:-}"           # leave empty for Claude Code
+FAKE="--runner fake"           # remove to use Claude Code
+
+# ── Stage 0: Planning run ────────────────────────────────────────────────────
+echo "→ Stage 0: planning"
+PLAN_JSON=$(agentctl $FAKE --db "$DB" --json run \
+  --agent "dag/plan" \
+  "Analyse the project and produce a brief work plan.")
+
+PLAN_ID=$(jq -r '.id'     <<< "$PLAN_JSON")
+PLAN_OK=$(jq -r '.status' <<< "$PLAN_JSON")
+echo "  plan run=$PLAN_ID status=$PLAN_OK"
+
+if [[ "$PLAN_OK" != "completed" ]]; then
+  echo "Plan step failed — aborting." >&2; exit 1
+fi
+
+# ── Stage 1A: Parallel fan-out ───────────────────────────────────────────────
+echo "→ Stage 1: parallel workers"
+
+# Launch both workers in the background; capture their JSON output to temp files.
+TMP=$(mktemp -d)
+
+agentctl $FAKE --db "$DB" --json run \
+  --agent "dag/backend" \
+  --parent-run-id "$PLAN_ID" \
+  "Review the backend service for issues." \
+  > "$TMP/backend.json" &
+PID_BACKEND=$!
+
+agentctl $FAKE --db "$DB" --json run \
+  --agent "dag/frontend" \
+  --parent-run-id "$PLAN_ID" \
+  "Review the frontend code for issues." \
+  > "$TMP/frontend.json" &
+PID_FRONTEND=$!
+
+# Wait for both to complete.
+wait "$PID_BACKEND"  "$PID_FRONTEND"
+
+BACKEND_STATUS=$(jq -r '.status' "$TMP/backend.json")
+FRONTEND_STATUS=$(jq -r '.status' "$TMP/frontend.json")
+BACKEND_ID=$(jq -r '.id' "$TMP/backend.json")
+FRONTEND_ID=$(jq -r '.id' "$TMP/frontend.json")
+echo "  backend  run=$BACKEND_ID  status=$BACKEND_STATUS"
+echo "  frontend run=$FRONTEND_ID status=$FRONTEND_STATUS"
+
+# Collect results for the next stage.
+BACKEND_RESULT=$(jq -r '.result // ""'  "$TMP/backend.json")
+FRONTEND_RESULT=$(jq -r '.result // ""' "$TMP/frontend.json")
+
+# ── Stage 2: Fan-in synthesis ─────────────────────────────────────────────────
+echo "→ Stage 2: synthesise"
+
+SYNTH_JSON=$(agentctl $FAKE --db "$DB" --json run \
+  --agent "dag/synthesise" \
+  --parent-run-id "$PLAN_ID" \
+  "Combine these findings into a prioritised action list.
+
+Backend findings:
+$BACKEND_RESULT
+
+Frontend findings:
+$FRONTEND_RESULT")
+
+SYNTH_ID=$(jq -r '.id'     <<< "$SYNTH_JSON")
+SYNTH_OK=$(jq -r '.status' <<< "$SYNTH_JSON")
+echo "  synth run=$SYNTH_ID status=$SYNTH_OK"
+
+# ── Stage 3: Conditional verification ────────────────────────────────────────
+if [[ "$SYNTH_OK" == "completed" ]]; then
+  echo "→ Stage 3: verify"
+  agentctl $FAKE --db "$DB" --json run \
+    --agent "dag/verify" \
+    --parent-run-id "$SYNTH_ID" \
+    "Verify the action list is complete and actionable." \
+    | jq -r '"  verify run=\(.id) status=\(.status)"'
+else
+  echo "  synthesis step did not complete — skipping verify." >&2
+fi
+
+echo "Done. View the run tree:"
+echo "  agentctl status $PLAN_ID"
+```
+
+### Customisation notes
+
+| Need | Change |
+|------|--------|
+| Use Claude Code instead of the fake runner | Remove `$FAKE` from each `agentctl` call |
+| More parallel branches | Add more background `agentctl … &` calls before `wait` |
+| Pass output between stages | Capture `.result` with `jq` and interpolate into the next prompt |
+| Retry a failed branch | Wrap the `agentctl` call in a `for attempt in 1 2 3; do … done` loop |
+| Make the plan step also a child run | Add `--parent-run-id` pointing to an outer coordination run |
+| Adjust timeouts | Add `--timeout <seconds>` to individual runs |
+
+The `--parent-run-id` flag links child runs to their parent in the database,
+so the web dashboard will show the full delegation tree under the planning run.
+
+---
+
 ## Quick reference
 
 | Goal | Key flags |

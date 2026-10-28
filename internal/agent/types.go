@@ -125,6 +125,10 @@ type Run struct {
 	Model string `json:"model,omitempty"`
 	// ParentRunID is set when this run was spawned as a child of another run.
 	ParentRunID string `json:"parent_run_id,omitempty"`
+	// JobID is the ID of the root run of this run's tree.
+	// For root runs JobID == ID. For child runs it is inherited from the parent.
+	// Empty for runs created before this field was introduced.
+	JobID string `json:"job_id,omitempty"`
 	// PID is the OS process ID of the runner subprocess while running.
 	// Zero if the runner doesn't track process IDs.
 	PID int `json:"pid,omitempty"`

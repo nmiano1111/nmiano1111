@@ -34,6 +34,17 @@ type Store interface {
 	// created_at ascending. Returns an empty slice (not an error) if none exist.
 	ListChildRuns(ctx context.Context, parentRunID string) ([]*agent.Run, error)
 
+	// GetRunTree returns the root run and all its descendants using a recursive
+	// traversal, ordered by created_at ascending.
+	GetRunTree(ctx context.Context, rootID string) ([]*agent.Run, error)
+
+	// ListJobs returns root runs (job_id = id), ordered by created_at descending.
+	ListJobs(ctx context.Context, limit int) ([]*agent.Run, error)
+
+	// GetJobRuns returns all runs belonging to the given job, ordered by
+	// created_at ascending.
+	GetJobRuns(ctx context.Context, jobID string) ([]*agent.Run, error)
+
 	// Close releases any resources held by the store.
 	Close() error
 }

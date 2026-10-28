@@ -39,11 +39,16 @@ func (s *Server) routes() {
 	// Health
 	s.mux.HandleFunc("GET /api/v1/health", s.handleHealth)
 
+	// Jobs
+	s.mux.HandleFunc("GET /api/v1/jobs", s.handleListJobs)
+	s.mux.HandleFunc("GET /api/v1/jobs/{id}", s.handleGetJob)
+
 	// Runs
 	s.mux.HandleFunc("GET /api/v1/runs", s.handleListRuns)
 	s.mux.HandleFunc("POST /api/v1/runs", s.handleCreateRun)
 	s.mux.HandleFunc("GET /api/v1/runs/{id}", s.handleGetRun)
 	s.mux.HandleFunc("GET /api/v1/runs/{id}/children", s.handleListChildRuns)
+	s.mux.HandleFunc("GET /api/v1/runs/{id}/tree", s.handleGetRunTree)
 	s.mux.HandleFunc("POST /api/v1/runs/{id}/cancel", s.handleCancelRun)
 
 	// Events

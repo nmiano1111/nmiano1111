@@ -21,15 +21,16 @@ import (
 
 func newRunCmd() *cobra.Command {
 	var flags struct {
-		runner   string
-		model    string
-		agent    string
-		tools    []string
-		workDir  string
-		permMode string
-		isolate  bool
-		timeout  float64
-		verify   string
+		runner      string
+		model       string
+		agent       string
+		tools       []string
+		workDir     string
+		permMode    string
+		isolate     bool
+		timeout     float64
+		verify      string
+		parentRunID string
 	}
 
 	cmd := &cobra.Command{
@@ -49,7 +50,7 @@ Examples:
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			prompt := strings.Join(args, " ")
-			return runExecute(cmd.Context(), prompt, flags.runner, flags.model, flags.agent, flags.tools, flags.workDir, flags.permMode, flags.isolate, flags.timeout, flags.verify)
+			return runExecute(cmd.Context(), prompt, flags.runner, flags.model, flags.agent, flags.tools, flags.workDir, flags.permMode, flags.isolate, flags.timeout, flags.verify, flags.parentRunID)
 		},
 	}
 
@@ -62,11 +63,12 @@ Examples:
 	cmd.Flags().BoolVar(&flags.isolate, "isolate", false, "fork a git worktree for filesystem isolation")
 	cmd.Flags().Float64Var(&flags.timeout, "timeout", 0, "cancel the run after this many seconds (0 = no timeout)")
 	cmd.Flags().StringVar(&flags.verify, "verify", "", "shell command to run after successful completion to validate output")
+	cmd.Flags().StringVar(&flags.parentRunID, "parent-run-id", "", "ID of the parent run (links this as a child in the dashboard)")
 
 	return cmd
 }
 
-func runExecute(ctx context.Context, prompt, runnerName, model, agentID string, tools []string, workDir, permMode string, isolate bool, timeoutSec float64, verify string) error {
+func runExecute(ctx context.Context, prompt, runnerName, model, agentID string, tools []string, workDir, permMode string, isolate bool, timeoutSec float64, verify, parentRunID string) error {
 	// Select runner.
 	var runner agent.Runner
 	switch runnerName {
@@ -98,8 +100,9 @@ func runExecute(ctx context.Context, prompt, runnerName, model, agentID string, 
 	orch := orchestration.New(runner, st, log)
 
 	req := agent.RunRequest{
-		AgentID: agentID,
-		Prompt:  prompt,
+		AgentID:     agentID,
+		Prompt:      prompt,
+		ParentRunID: parentRunID,
 		Config: agent.RunConfig{
 			Model:           model,
 			AllowedTools:    tools,
@@ -156,13 +159,24 @@ func streamTUI(exec *orchestration.Execution) error {
 	return nil
 }
 
-// streamJSONL emits events as JSONL on stdout.
+// streamJSONL emits events as JSONL on stdout, then emits the final run record.
 func streamJSONL(exec *orchestration.Execution) error {
 	p := ui.NewPrinter(os.Stdout, true)
 	for e := range exec.Events {
 		eCopy := e
 		p.PrintEvent(&eCopy)
 	}
+	// Emit the final run record so callers can inspect .id, .status, .result.
+	st, err := openStore()
+	if err != nil {
+		return nil // best-effort; events already emitted
+	}
+	defer st.Close()
+	run, err := st.GetRun(context.Background(), exec.Run.ID)
+	if err != nil {
+		return nil
+	}
+	p.PrintRun(run)
 	return nil
 }
 

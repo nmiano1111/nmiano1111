@@ -77,6 +77,11 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("sqlite: pragma journal_mode: %w", err)
 	}
+	// Allow up to 5 s of retries when the DB is locked by another writer.
+	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("sqlite: pragma busy_timeout: %w", err)
+	}
 	if _, err := db.Exec("PRAGMA foreign_keys=ON"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("sqlite: pragma foreign_keys: %w", err)
@@ -145,6 +150,11 @@ func (s *Store) migrate() error {
 		`ALTER TABLE runs ADD COLUMN pid INTEGER NOT NULL DEFAULT 0`,
 		// Partial index on parent_run_id — created after the column exists.
 		`CREATE INDEX IF NOT EXISTS idx_runs_parent ON runs(parent_run_id) WHERE parent_run_id != ''`,
+		// job_id: denormalized root-run ID for the whole tree.
+		`ALTER TABLE runs ADD COLUMN job_id TEXT NOT NULL DEFAULT ''`,
+		// Backfill: root runs (no parent) get job_id = id.
+		`UPDATE runs SET job_id = id WHERE parent_run_id = '' AND job_id = ''`,
+		`CREATE INDEX IF NOT EXISTS idx_runs_job ON runs(job_id)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.Exec(stmt); err != nil {
@@ -166,17 +176,32 @@ func (s *Store) Close() error { return s.db.Close() }
 
 // CreateRun implements store.Store.
 func (s *Store) CreateRun(ctx context.Context, r *agent.Run) error {
+	// Resolve job_id: inherit from parent or self-assign for root runs.
+	if r.JobID == "" {
+		if r.ParentRunID != "" {
+			var parentJobID string
+			_ = s.db.QueryRowContext(ctx,
+				`SELECT job_id FROM runs WHERE id = ?`, r.ParentRunID,
+			).Scan(&parentJobID)
+			if parentJobID != "" {
+				r.JobID = parentJobID
+			}
+		}
+		if r.JobID == "" {
+			r.JobID = r.ID // root run
+		}
+	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO runs
 			(id, agent_id, prompt, status, runner_name, model,
 			 created_at, started_at, completed_at,
 			 result, error, cost_usd, input_tokens, output_tokens, duration_ms,
-			 parent_run_id, pid)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			 parent_run_id, job_id, pid)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.AgentID, r.Prompt, string(r.Status), r.RunnerName, r.Model,
 		r.CreatedAt.UTC(), nullTime(r.StartedAt), nullTime(r.CompletedAt),
 		r.Result, r.Error, r.CostUSD, r.InputTokens, r.OutputTokens, r.DurationMS,
-		r.ParentRunID, r.PID,
+		r.ParentRunID, r.JobID, r.PID,
 	)
 	if err != nil {
 		return fmt.Errorf("sqlite: create run: %w", err)
@@ -214,7 +239,7 @@ func (s *Store) GetRun(ctx context.Context, id string) (*agent.Run, error) {
 		SELECT id, agent_id, prompt, status, runner_name, model,
 		       created_at, started_at, completed_at,
 		       result, error, cost_usd, input_tokens, output_tokens, duration_ms,
-		       parent_run_id, pid
+		       parent_run_id, job_id, pid
 		FROM runs WHERE id=?`, id)
 	r, err := scanRun(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -231,7 +256,7 @@ func (s *Store) ListRuns(ctx context.Context, limit int) ([]*agent.Run, error) {
 	q := `SELECT id, agent_id, prompt, status, runner_name, model,
 	             created_at, started_at, completed_at,
 	             result, error, cost_usd, input_tokens, output_tokens, duration_ms,
-	             parent_run_id, pid
+	             parent_run_id, job_id, pid
 	      FROM runs ORDER BY created_at DESC`
 	var args []any
 	if limit > 0 {
@@ -260,10 +285,106 @@ func (s *Store) ListChildRuns(ctx context.Context, parentRunID string) ([]*agent
 		SELECT id, agent_id, prompt, status, runner_name, model,
 		       created_at, started_at, completed_at,
 		       result, error, cost_usd, input_tokens, output_tokens, duration_ms,
-		       parent_run_id, pid
+		       parent_run_id, job_id, pid
 		FROM runs WHERE parent_run_id=? ORDER BY created_at ASC`, parentRunID)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: list child runs: %w", err)
+	}
+	defer rows.Close()
+	var runs []*agent.Run
+	for rows.Next() {
+		r, err := scanRun(rows)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite: scan run: %w", err)
+		}
+		runs = append(runs, r)
+	}
+	if runs == nil {
+		runs = []*agent.Run{}
+	}
+	return runs, rows.Err()
+}
+
+// GetRunTree implements store.Store.
+// Returns the root run plus all its descendants using a recursive CTE,
+// ordered by created_at ascending.
+func (s *Store) GetRunTree(ctx context.Context, rootID string) ([]*agent.Run, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		WITH RECURSIVE tree AS (
+			SELECT id, agent_id, prompt, status, runner_name, model,
+			       created_at, started_at, completed_at,
+			       result, error, cost_usd, input_tokens, output_tokens, duration_ms,
+			       parent_run_id, job_id, pid
+			FROM runs WHERE id = ?
+			UNION ALL
+			SELECT r.id, r.agent_id, r.prompt, r.status, r.runner_name, r.model,
+			       r.created_at, r.started_at, r.completed_at,
+			       r.result, r.error, r.cost_usd, r.input_tokens, r.output_tokens, r.duration_ms,
+			       r.parent_run_id, r.job_id, r.pid
+			FROM runs r JOIN tree t ON r.parent_run_id = t.id
+		)
+		SELECT * FROM tree ORDER BY created_at ASC`, rootID)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: get run tree: %w", err)
+	}
+	defer rows.Close()
+	var runs []*agent.Run
+	for rows.Next() {
+		r, err := scanRun(rows)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite: scan run: %w", err)
+		}
+		runs = append(runs, r)
+	}
+	if runs == nil {
+		runs = []*agent.Run{}
+	}
+	return runs, rows.Err()
+}
+
+// ListJobs implements store.Store.
+// Returns root runs (where job_id = id), ordered by created_at descending.
+func (s *Store) ListJobs(ctx context.Context, limit int) ([]*agent.Run, error) {
+	q := `SELECT id, agent_id, prompt, status, runner_name, model,
+	             created_at, started_at, completed_at,
+	             result, error, cost_usd, input_tokens, output_tokens, duration_ms,
+	             parent_run_id, job_id, pid
+	      FROM runs WHERE job_id = id ORDER BY created_at DESC`
+	var args []any
+	if limit > 0 {
+		q += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: list jobs: %w", err)
+	}
+	defer rows.Close()
+	var runs []*agent.Run
+	for rows.Next() {
+		r, err := scanRun(rows)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite: scan run: %w", err)
+		}
+		runs = append(runs, r)
+	}
+	if runs == nil {
+		runs = []*agent.Run{}
+	}
+	return runs, rows.Err()
+}
+
+// GetJobRuns implements store.Store.
+// Returns all runs belonging to the given job, ordered by created_at ascending.
+func (s *Store) GetJobRuns(ctx context.Context, jobID string) ([]*agent.Run, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, agent_id, prompt, status, runner_name, model,
+		       created_at, started_at, completed_at,
+		       result, error, cost_usd, input_tokens, output_tokens, duration_ms,
+		       parent_run_id, job_id, pid
+		FROM runs WHERE job_id = ? ORDER BY created_at ASC`, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: get job runs: %w", err)
 	}
 	defer rows.Close()
 	var runs []*agent.Run
@@ -352,7 +473,7 @@ func scanRun(row scanner) (*agent.Run, error) {
 		&r.ID, &r.AgentID, &r.Prompt, &status, &r.RunnerName, &r.Model,
 		&createdStr, &startedStr, &completedStr,
 		&r.Result, &r.Error, &r.CostUSD, &r.InputTokens, &r.OutputTokens, &r.DurationMS,
-		&r.ParentRunID, &r.PID,
+		&r.ParentRunID, &r.JobID, &r.PID,
 	)
 	if err != nil {
 		return nil, err

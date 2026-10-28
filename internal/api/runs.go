@@ -168,6 +168,26 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
 }
 
+func (s *Server) handleGetRunTree(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, err := s.st.GetRun(r.Context(), id); err != nil {
+		if _, ok := err.(store.ErrNotFound); ok {
+			writeError(w, http.StatusNotFound, "run not found")
+			return
+		}
+		s.log.Error("get run", slog.String("id", id), slog.Any("err", err))
+		writeError(w, http.StatusInternalServerError, "failed to get run")
+		return
+	}
+	runs, err := s.st.GetRunTree(r.Context(), id)
+	if err != nil {
+		s.log.Error("get run tree", slog.String("root_id", id), slog.Any("err", err))
+		writeError(w, http.StatusInternalServerError, "failed to get run tree")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"runs": runs})
+}
+
 func (s *Server) handleListChildRuns(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if _, err := s.st.GetRun(r.Context(), id); err != nil {

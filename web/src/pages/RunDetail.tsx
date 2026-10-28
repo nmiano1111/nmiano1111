@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useParams, Link } from 'react-router-dom'
-import { ArrowLeft, StopCircle, Activity, GitBranch, List, Network } from 'lucide-react'
+import { ArrowLeft, StopCircle, Activity, GitBranch, List, Network, Workflow } from 'lucide-react'
 import { useRun, useEvents, useLiveRun, useCancelRun, useChildRuns } from '@/lib/hooks'
 import { StatusBadge } from '@/components/ui/StatusBadge'
 import { Button } from '@/components/ui/Button'
@@ -134,18 +134,30 @@ export function RunDetailPage() {
           </div>
         )}
 
-        {/* Parent run link */}
-        {run.parent_run_id && (
-          <div className="px-6 py-3 border-b border-base-300 bg-base-100/20">
-            <span className="text-xs text-text-dim">
-              <GitBranch size={11} className="inline mr-1" />
-              Spawned by{' '}
+        {/* Job context — shown for any run that belongs to a multi-run job */}
+        {run.job_id && run.job_id !== run.id && (
+          <div className="px-6 py-3 border-b border-base-300 bg-accent/5">
+            <span className="text-xs text-text-dim flex items-center gap-2">
+              <GitBranch size={11} className="text-accent shrink-0" />
+              Part of job{' '}
               <Link
-                to={`/runs/${run.parent_run_id}`}
+                to={`/jobs/${run.job_id}`}
                 className="text-accent hover:underline font-mono"
               >
-                {shortId(run.parent_run_id)}
+                {shortId(run.job_id)}
               </Link>
+              {run.parent_run_id && (
+                <>
+                  <span className="text-text-dim/40">·</span>
+                  spawned by{' '}
+                  <Link
+                    to={`/runs/${run.parent_run_id}`}
+                    className="text-accent hover:underline font-mono"
+                  >
+                    {shortId(run.parent_run_id)}
+                  </Link>
+                </>
+              )}
             </span>
           </div>
         )}
@@ -153,10 +165,19 @@ export function RunDetailPage() {
         {/* Delegated tasks (child runs) */}
         {childRuns.length > 0 && (
           <div className="px-6 py-4 border-b border-base-300">
-            <p className="field-label mb-3 flex items-center gap-1.5">
-              <Network size={12} />
-              Delegated Tasks ({childRuns.length})
-            </p>
+            <div className="flex items-center justify-between mb-3">
+              <p className="field-label flex items-center gap-1.5">
+                <Network size={12} />
+                Delegated Tasks ({childRuns.length})
+              </p>
+              <Link
+                to={`/runs/${run.id}/tree`}
+                className="flex items-center gap-1 text-xs text-accent hover:underline"
+              >
+                <Workflow size={11} />
+                View full tree
+              </Link>
+            </div>
             <div className="space-y-1.5">
               {childRuns.map((child) => (
                 <Link

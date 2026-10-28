@@ -1,6 +1,8 @@
 import type {
   ListRunsResponse,
   ListEventsResponse,
+  ListJobsResponse,
+  JobDetail,
   Run,
   CreateRunRequest,
   AgentEvent,
@@ -45,6 +47,14 @@ export const api = {
   health: () =>
     request<{ status: string; version: string }>('/health'),
 
+  jobs: {
+    list: (limit = 50) =>
+      request<ListJobsResponse>(`/jobs?limit=${limit}`),
+
+    get: (id: string) =>
+      request<JobDetail>(`/jobs/${id}`),
+  },
+
   runs: {
     list: (limit = 50) =>
       request<ListRunsResponse>(`/runs?limit=${limit}`),
@@ -63,6 +73,9 @@ export const api = {
 
     listChildren: (id: string) =>
       request<ListRunsResponse>(`/runs/${id}/children`),
+
+    getTree: (id: string) =>
+      request<ListRunsResponse>(`/runs/${id}/tree`),
   },
 
   events: {

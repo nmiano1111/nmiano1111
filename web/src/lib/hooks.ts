@@ -6,10 +6,32 @@ import type { Run, AgentEvent } from '@/api/types'
 // ── Query keys ────────────────────────────────────────────────────────────────
 
 export const queryKeys = {
+  jobs: (limit?: number) => ['jobs', limit] as const,
+  job: (id: string) => ['jobs', id] as const,
   runs: (limit?: number) => ['runs', limit] as const,
   run: (id: string) => ['runs', id] as const,
   childRuns: (id: string) => ['runs', id, 'children'] as const,
   events: (runId: string) => ['events', runId] as const,
+}
+
+// ── Job queries ───────────────────────────────────────────────────────────────
+
+export function useJobs(limit = 50) {
+  return useQuery({
+    queryKey: queryKeys.jobs(limit),
+    queryFn: () => api.jobs.list(limit),
+    refetchInterval: 3000,
+    select: (data) => data.jobs,
+  })
+}
+
+export function useJob(id: string) {
+  return useQuery({
+    queryKey: queryKeys.job(id),
+    queryFn: () => api.jobs.get(id),
+    enabled: !!id,
+    refetchInterval: 5000,
+  })
 }
 
 // ── Run queries ───────────────────────────────────────────────────────────────
@@ -44,6 +66,16 @@ export function useChildRuns(runId: string) {
   return useQuery({
     queryKey: queryKeys.childRuns(runId),
     queryFn: () => api.runs.listChildren(runId),
+    enabled: !!runId,
+    refetchInterval: 5000,
+    select: (data) => data.runs,
+  })
+}
+
+export function useRunTree(runId: string) {
+  return useQuery({
+    queryKey: ['runs', runId, 'tree'] as const,
+    queryFn: () => api.runs.getTree(runId),
     enabled: !!runId,
     refetchInterval: 5000,
     select: (data) => data.runs,

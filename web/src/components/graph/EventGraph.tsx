@@ -1,4 +1,4 @@
-import { useMemo, useEffect } from 'react'
+import { useMemo, useEffect, useState } from 'react'
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -31,19 +31,46 @@ interface ToolEntry {
   errorCount: number
 }
 
+interface ToolCallDetail {
+  name: string
+  keyParam: string  // most meaningful input param (filename, command, …)
+  result: string    // brief result snippet
+  isError: boolean
+}
+
 interface Step {
   id: string
   kind: StepKind
-  label: string          // primary text
-  sublabel?: string      // secondary / command text
-  // tool_cluster only
-  tools?: ToolEntry[]    // per-tool breakdown
+  label: string
+  sublabel?: string
+  // tool_cluster
+  tools?: ToolEntry[]
+  toolCallDetails?: ToolCallDetail[]  // per-call details for expanded view
   totalCalls?: number
   totalErrors?: number
-  // reasoning only
+  // reasoning
   textCount?: number
+  fullText?: string   // full concatenated text for expanded view
   // terminal / verify
   isError?: boolean
+}
+
+// Extract the most meaningful single parameter from a tool's input object.
+function toolKeyParam(input: unknown): string {
+  if (!input || typeof input !== 'object') return ''
+  const obj = input as Record<string, unknown>
+  for (const key of ['file_path', 'path', 'command', 'url', 'query', 'pattern', 'glob']) {
+    const v = obj[key]
+    if (typeof v === 'string' && v.length > 0) {
+      return (key === 'file_path' || key === 'path')
+        ? (v.split('/').pop() ?? v)
+        : v.slice(0, 60)
+    }
+  }
+  for (const v of Object.values(obj)) {
+    if (typeof v === 'string' && v.length > 0) return v.slice(0, 60)
+  }
+  return ''
 }
 
 
@@ -60,44 +87,50 @@ function computeSteps(events: AgentEvent[]): Step[] {
 
   const steps: Step[] = []
   let pendingText: AgentEvent[] = []
-  // Accumulate consecutive tool_use events into a cluster
-  let pendingTools: Array<{ name: string; isError: boolean }> = []
+  let pendingToolDetails: ToolCallDetail[] = []
   let idx = 0
 
   const flushText = () => {
     if (pendingText.length === 0) return
-    const first = (pendingText[0].data ?? {}) as Record<string, unknown>
-    const content = String(first.content ?? '').replace(/\n/g, ' ').trim()
+    const allText = pendingText
+      .map((e) => String(((e.data ?? {}) as Record<string, unknown>).content ?? '').trim())
+      .join('\n\n')
+    const firstLine = allText.replace(/\n/g, ' ').trim()
     const label =
       pendingText.length > 1
         ? `Reasoning · ${pendingText.length} messages`
-        : content.slice(0, 70) || 'Reasoning'
-    steps.push({ id: `reasoning-${idx++}`, kind: 'reasoning', label, textCount: pendingText.length })
+        : firstLine.slice(0, 70) || 'Reasoning'
+    steps.push({
+      id: `reasoning-${idx++}`,
+      kind: 'reasoning',
+      label,
+      textCount: pendingText.length,
+      fullText: allText,
+    })
     pendingText = []
   }
 
   const flushTools = () => {
-    if (pendingTools.length === 0) return
-    // Count per tool name, preserving first-seen order
+    if (pendingToolDetails.length === 0) return
     const byName = new Map<string, ToolEntry>()
-    for (const t of pendingTools) {
+    for (const t of pendingToolDetails) {
       const entry = byName.get(t.name) ?? { name: t.name, count: 0, errorCount: 0 }
       entry.count++
       if (t.isError) entry.errorCount++
       byName.set(t.name, entry)
     }
-    const tools = Array.from(byName.values())
-    const totalErrors = pendingTools.filter((t) => t.isError).length
-    const n = pendingTools.length
+    const n = pendingToolDetails.length
+    const totalErrors = pendingToolDetails.filter((t) => t.isError).length
     steps.push({
       id: `tools-${idx++}`,
       kind: 'tool_cluster',
       label: `${n} tool call${n > 1 ? 's' : ''}`,
-      tools,
+      tools: Array.from(byName.values()),
+      toolCallDetails: [...pendingToolDetails],
       totalCalls: n,
       totalErrors,
     })
-    pendingTools = []
+    pendingToolDetails = []
   }
 
   for (const e of events) {
@@ -112,11 +145,13 @@ function computeSteps(events: AgentEvent[]): Step[] {
 
     if (e.kind === 'tool_use') {
       flushText()
+      const d = (e.data ?? {}) as Record<string, unknown>
       const rd = resultByUseSeq.get(e.seq)
       const rdData = rd ? (rd.data ?? {}) as Record<string, unknown> : null
-      const d = (e.data ?? {}) as Record<string, unknown>
-      pendingTools.push({
+      pendingToolDetails.push({
         name: String(d.name ?? 'tool'),
+        keyParam: toolKeyParam(d.input),
+        result: rdData ? String(rdData.content ?? '').slice(0, 80).replace(/\n/g, ' ').trim() : '',
         isError: rdData ? Boolean(rdData.is_error) : false,
       })
       continue
@@ -159,14 +194,32 @@ function computeSteps(events: AgentEvent[]): Step[] {
   return steps
 }
 
+
 // ── Node component ────────────────────────────────────────────────────────────
 
 interface StepNodeData extends Record<string, unknown> {
   step: Step
 }
 
+function ExpandToggle({ expanded, onClick }: { expanded: boolean; onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      // Stop mousedown so React Flow's drag handler doesn't swallow the click
+      onMouseDown={(e) => e.stopPropagation()}
+      className="flex items-center gap-0.5 text-[10px] text-text-dim/70 hover:text-text-dim bg-base-300/40 hover:bg-base-300/70 rounded px-1.5 py-0.5 transition-colors cursor-pointer"
+      title={expanded ? 'Collapse' : 'Expand'}
+    >
+      {expanded ? 'less ▴' : 'more ▾'}
+    </button>
+  )
+}
+
 function StepNode({ data }: { data: StepNodeData }) {
   const { step } = data
+  const [expanded, setExpanded] = useState(false)
+  const canExpand = step.kind === 'tool_cluster' || step.kind === 'reasoning'
+
   const handle = (type: 'source' | 'target', pos: Position) => (
     <Handle type={type} position={pos}
       style={{ background: '#585b70', width: 6, height: 6, border: 'none' }} />
@@ -175,27 +228,60 @@ function StepNode({ data }: { data: StepNodeData }) {
   if (step.kind === 'tool_cluster') {
     const hasErrors = (step.totalErrors ?? 0) > 0
     return (
-      <div className="rounded border bg-mauve/5 border-mauve/30 min-w-[180px] max-w-[260px] select-none">
+      <div className="rounded border bg-mauve/5 border-mauve/30 min-w-[200px] max-w-[280px] select-none">
         {handle('target', Position.Left)}
         <div className="px-3 pt-2 pb-2">
-          <div className="text-[10px] font-semibold uppercase tracking-wider text-mauve/60 mb-1.5">
-            ⚡ {step.totalCalls} Tool Call{step.totalCalls !== 1 ? 's' : ''}
+          <div className="flex items-center justify-between mb-1.5">
+            <div className="text-[10px] font-semibold uppercase tracking-wider text-mauve/60">
+              ⚡ {step.totalCalls} Tool Call{step.totalCalls !== 1 ? 's' : ''}
+            </div>
+            {canExpand && <ExpandToggle expanded={expanded} onClick={() => setExpanded((v) => !v)} />}
           </div>
           <div className="flex flex-wrap gap-x-3 gap-y-0.5">
             {step.tools?.map((t) => (
               <span key={t.name}
                 className={cn('text-[11px]', t.errorCount > 0 ? 'text-red/80' : 'text-text-dim')}
               >
-                {t.name}{t.count > 1 ? <span className="text-text-dim/60"> ×{t.count}</span> : null}
+                {t.name}{t.count > 1 ? <span className="text-text-dim/50"> ×{t.count}</span> : null}
               </span>
             ))}
           </div>
           {hasErrors && (
-            <div className="text-[10px] text-red/60 mt-1.5">
+            <div className="text-[10px] text-red/60 mt-1">
               {step.totalErrors} error{step.totalErrors !== 1 ? 's' : ''}
             </div>
           )}
         </div>
+
+        {/* Expanded: per-call detail list */}
+        {expanded && step.toolCallDetails && step.toolCallDetails.length > 0 && (
+          <div className="border-t border-mauve/15 max-h-52 overflow-y-auto">
+            {step.toolCallDetails.map((call, i) => (
+              <div key={i} className="flex items-start gap-2 px-3 py-1 border-b border-mauve/10 last:border-0">
+                <span className={cn('text-[10px] shrink-0 mt-px', call.isError ? 'text-red/70' : 'text-green/60')}>
+                  {call.isError ? '✗' : '✓'}
+                </span>
+                <div className="min-w-0">
+                  <div className="text-[11px] text-mauve/90 font-medium">
+                    {call.name}
+                    {call.keyParam && (
+                      <span className="font-mono text-text-dim/70 ml-1.5 font-normal">{call.keyParam}</span>
+                    )}
+                  </div>
+                  {call.result && (
+                    <div className={cn(
+                      'text-[10px] truncate leading-snug mt-0.5',
+                      call.isError ? 'text-red/60' : 'text-text-dim/60',
+                    )}>
+                      {call.result}
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
         {handle('source', Position.Right)}
       </div>
     )
@@ -203,22 +289,37 @@ function StepNode({ data }: { data: StepNodeData }) {
 
   if (step.kind === 'reasoning') {
     return (
-      <div className="rounded border bg-base-100/50 border-base-300/50 min-w-[160px] max-w-[240px] select-none">
+      <div className="rounded border bg-base-100/50 border-base-300/50 min-w-[180px] max-w-[260px] select-none">
         {handle('target', Position.Left)}
-        <div className="px-3 py-2">
-          <div className="text-[10px] font-semibold uppercase tracking-wider text-text-dim/50 mb-1">
-            💭 Reasoning
+        <div className="px-3 pt-2 pb-2">
+          <div className="flex items-center justify-between mb-1">
+            <div className="text-[10px] font-semibold uppercase tracking-wider text-text-dim/50">
+              💭 Reasoning
+            </div>
+            {canExpand && step.fullText && (
+              <ExpandToggle expanded={expanded} onClick={() => setExpanded((v) => !v)} />
+            )}
           </div>
-          <div className="text-[11px] text-text-dim leading-snug" style={{ maxWidth: 210 }}>
+          <div className="text-[11px] text-text-dim leading-snug" style={{ maxWidth: 220 }}>
             {step.label}
           </div>
         </div>
+
+        {/* Expanded: full reasoning text */}
+        {expanded && step.fullText && (
+          <div className="border-t border-base-300/50 px-3 py-2 max-h-48 overflow-y-auto">
+            <p className="text-[10px] text-text-dim/80 leading-relaxed whitespace-pre-wrap">
+              {step.fullText}
+            </p>
+          </div>
+        )}
+
         {handle('source', Position.Right)}
       </div>
     )
   }
 
-  // completed / failed / verification
+  // completed / failed / verification — no expand
   const terminalStyle: Record<string, { border: string; bg: string; icon: string; color: string }> = {
     completed:    { border: 'border-green/40',  bg: 'bg-green/5',  icon: '✓', color: 'text-green' },
     failed:       { border: 'border-red/40',    bg: 'bg-red/5',    icon: '✗', color: 'text-red' },
@@ -232,17 +333,17 @@ function StepNode({ data }: { data: StepNodeData }) {
   const ts = terminalStyle[step.kind] ?? terminalStyle.completed
 
   return (
-    <div className={cn('rounded border min-w-[160px] max-w-[240px] select-none', ts.border, ts.bg)}>
+    <div className={cn('rounded border min-w-[160px] max-w-[260px] select-none', ts.border, ts.bg)}>
       {handle('target', Position.Left)}
       <div className="px-3 py-2">
         <div className={cn('text-[10px] font-semibold uppercase tracking-wider mb-1 opacity-70', ts.color)}>
           {ts.icon} {step.kind === 'verification' ? 'Verify' : step.kind === 'completed' ? 'Done' : 'Failed'}
         </div>
-        <div className={cn('text-[11px] leading-snug', ts.color)} style={{ maxWidth: 210 }}>
+        <div className={cn('text-[11px] leading-snug', ts.color)} style={{ maxWidth: 230 }}>
           {step.label}
         </div>
         {step.sublabel && (
-          <div className="text-[10px] text-text-dim font-mono mt-0.5 truncate" style={{ maxWidth: 210 }}>
+          <div className="text-[10px] text-text-dim font-mono mt-0.5 truncate" style={{ maxWidth: 230 }}>
             {step.sublabel}
           </div>
         )}

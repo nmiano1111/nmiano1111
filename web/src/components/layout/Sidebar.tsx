@@ -6,7 +6,7 @@ import { api } from '@/api/client'
 
 const navItems = [
   { to: '/', icon: LayoutDashboard, label: 'Overview', end: true },
-  { to: '/runs', icon: List, label: 'Runs', end: false },
+  { to: '/jobs', icon: List, label: 'Jobs', end: false },
 ]
 
 export function Sidebar() {
