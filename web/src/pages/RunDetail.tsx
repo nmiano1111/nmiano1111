@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useParams, Link } from 'react-router-dom'
+import { useParams, Link, useNavigate } from 'react-router-dom'
 import { ArrowLeft, StopCircle, Activity, GitBranch, List, Network, Workflow } from 'lucide-react'
 import { useRun, useEvents, useLiveRun, useCancelRun, useChildRuns } from '@/lib/hooks'
 import { StatusBadge } from '@/components/ui/StatusBadge'
@@ -22,6 +22,7 @@ type Tab = 'log' | 'graph'
 
 export function RunDetailPage() {
   const { id = '' } = useParams()
+  const navigate = useNavigate()
   const [tab, setTab] = useState<Tab>('log')
 
   const { data: initialRun, isLoading, error } = useRun(id)
@@ -45,8 +46,8 @@ export function RunDetailPage() {
         title="Run not found"
         description={`No run with ID ${shortId(id)} exists in the database.`}
         action={
-          <Link to="/runs">
-            <Button variant="default">Back to runs</Button>
+          <Link to="/jobs">
+            <Button variant="default">Back to jobs</Button>
           </Link>
         }
       />
@@ -64,9 +65,12 @@ export function RunDetailPage() {
       <PageHeader
         title={
           <div className="flex items-center gap-3">
-            <Link to="/runs" className="text-text-dim hover:text-text transition-colors">
+            <button
+              onClick={() => navigate(-1)}
+              className="text-text-dim hover:text-text transition-colors"
+            >
               <ArrowLeft size={16} />
-            </Link>
+            </button>
             <span className="font-mono text-sm text-accent">{shortId(run.id)}</span>
             <StatusBadge status={run.status} pulse />
           </div>
