@@ -8,6 +8,7 @@ import type { Run, AgentEvent } from '@/api/types'
 export const queryKeys = {
   runs: (limit?: number) => ['runs', limit] as const,
   run: (id: string) => ['runs', id] as const,
+  childRuns: (id: string) => ['runs', id, 'children'] as const,
   events: (runId: string) => ['events', runId] as const,
 }
 
@@ -36,6 +37,16 @@ export function useEvents(runId: string) {
     queryFn: () => api.events.list(runId),
     enabled: !!runId,
     select: (data) => data.events,
+  })
+}
+
+export function useChildRuns(runId: string) {
+  return useQuery({
+    queryKey: queryKeys.childRuns(runId),
+    queryFn: () => api.runs.listChildren(runId),
+    enabled: !!runId,
+    refetchInterval: 5000,
+    select: (data) => data.runs,
   })
 }
 

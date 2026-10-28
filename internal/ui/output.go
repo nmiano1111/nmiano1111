@@ -158,27 +158,42 @@ func FormatRunTable(runs []*agent.Run) string {
 	}
 
 	const (
-		idW   = 36 // full UUID
-		agW   = 14
-		stW   = 12
-		timeW = 10
-		costW = 8
+		idW     = 36 // full UUID
+		agW     = 14
+		stW     = 12
+		timeW   = 10
+		costW   = 8
+		parentW = 10 // short parent ID
 	)
+
+	// Show PARENT column only when at least one run has a parent.
+	hasParents := false
+	for _, r := range runs {
+		if r.ParentRunID != "" {
+			hasParents = true
+			break
+		}
+	}
 
 	col := func(s string, w int) string { return fmt.Sprintf("%-*s", w, s) }
 
-	header := "  " + strings.Join([]string{
+	cols := []string{
 		StyleDim.Render(col("ID", idW)),
 		StyleDim.Render(col("AGENT", agW)),
 		StyleDim.Render(col("STATUS", stW)),
 		StyleDim.Render(col("CREATED", timeW)),
 		StyleDim.Render(col("COST", costW)),
-	}, "  ")
+	}
+	ruleW := idW + agW + stW + timeW + costW + 8
+	if hasParents {
+		cols = append(cols, StyleDim.Render(col("PARENT", parentW)))
+		ruleW += parentW + 2
+	}
 
 	var sb strings.Builder
 	sb.WriteString("\n")
-	sb.WriteString(header + "\n")
-	sb.WriteString("  " + HRule(idW+agW+stW+timeW+costW+8) + "\n")
+	sb.WriteString("  " + strings.Join(cols, "  ") + "\n")
+	sb.WriteString("  " + HRule(ruleW) + "\n")
 
 	for _, r := range runs {
 		badge, style := statusBadge(r.Status)
@@ -186,14 +201,21 @@ func FormatRunTable(runs []*agent.Run) string {
 		if r.CostUSD > 0 {
 			cost = fmt.Sprintf("$%.4f", r.CostUSD)
 		}
-		row := "  " + strings.Join([]string{
+		rowCols := []string{
 			StyleRunID.Render(col(r.ID, idW)),
 			StyleBase.Render(col(trunc(r.AgentID, agW), agW)),
 			style.Render(col(trunc(badge, stW), stW)),
 			StyleDim.Render(col(relTime(r.CreatedAt), timeW)),
 			StyleDim.Render(col(cost, costW)),
-		}, "  ")
-		sb.WriteString(row + "\n")
+		}
+		if hasParents {
+			parent := "—"
+			if r.ParentRunID != "" {
+				parent = "↳ " + ShortID(r.ParentRunID)
+			}
+			rowCols = append(rowCols, StyleDim.Render(col(parent, parentW)))
+		}
+		sb.WriteString("  " + strings.Join(rowCols, "  ") + "\n")
 	}
 	sb.WriteString("\n")
 	return sb.String()

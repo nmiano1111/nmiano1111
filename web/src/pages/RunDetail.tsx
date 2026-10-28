@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useParams, Link } from 'react-router-dom'
-import { ArrowLeft, StopCircle, Activity, GitBranch, List } from 'lucide-react'
-import { useRun, useEvents, useLiveRun, useCancelRun } from '@/lib/hooks'
+import { ArrowLeft, StopCircle, Activity, GitBranch, List, Network } from 'lucide-react'
+import { useRun, useEvents, useLiveRun, useCancelRun, useChildRuns } from '@/lib/hooks'
 import { StatusBadge } from '@/components/ui/StatusBadge'
 import { Button } from '@/components/ui/Button'
 import { PageHeader } from '@/components/ui/PageHeader'
@@ -16,6 +16,7 @@ import {
   formatCost,
   formatTokens,
   formatFullDate,
+  formatRelativeTime,
 } from '@/lib/utils'
 type Tab = 'log' | 'graph'
 
@@ -25,6 +26,7 @@ export function RunDetailPage() {
 
   const { data: initialRun, isLoading, error } = useRun(id)
   const { data: initialEvents = [] } = useEvents(id)
+  const { data: childRuns = [] } = useChildRuns(id)
   const cancelRun = useCancelRun()
 
   // Live stream (replays existing events + streams new ones)
@@ -145,6 +147,41 @@ export function RunDetailPage() {
                 {shortId(run.parent_run_id)}
               </Link>
             </span>
+          </div>
+        )}
+
+        {/* Delegated tasks (child runs) */}
+        {childRuns.length > 0 && (
+          <div className="px-6 py-4 border-b border-base-300">
+            <p className="field-label mb-3 flex items-center gap-1.5">
+              <Network size={12} />
+              Delegated Tasks ({childRuns.length})
+            </p>
+            <div className="space-y-1.5">
+              {childRuns.map((child) => (
+                <Link
+                  key={child.id}
+                  to={`/runs/${child.id}`}
+                  className="flex items-center gap-3 px-3 py-2 rounded bg-base-100/40 hover:bg-base-100/80 transition-colors group"
+                >
+                  <StatusBadge status={child.status} />
+                  <span className="font-mono text-xs text-accent group-hover:underline">
+                    {shortId(child.id)}
+                  </span>
+                  <span className="text-xs text-text-dim truncate flex-1">
+                    {child.prompt}
+                  </span>
+                  <span className="text-xs text-text-dim shrink-0">
+                    {formatRelativeTime(child.created_at)}
+                  </span>
+                  {child.cost_usd > 0 && (
+                    <span className="text-xs text-text-dim font-mono shrink-0">
+                      {formatCost(child.cost_usd)}
+                    </span>
+                  )}
+                </Link>
+              ))}
+            </div>
           </div>
         )}
 

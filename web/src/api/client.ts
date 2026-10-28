@@ -60,6 +60,9 @@ export const api = {
 
     cancel: (id: string) =>
       request<{ status: string }>(`/runs/${id}/cancel`, { method: 'POST' }),
+
+    listChildren: (id: string) =>
+      request<ListRunsResponse>(`/runs/${id}/children`),
   },
 
   events: {

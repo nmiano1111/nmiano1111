@@ -30,6 +30,10 @@ type Store interface {
 	// ListEvents returns all events for a run, ordered by seq ascending.
 	ListEvents(ctx context.Context, runID string) ([]*agent.Event, error)
 
+	// ListChildRuns returns all runs with the given parentRunID, ordered by
+	// created_at ascending. Returns an empty slice (not an error) if none exist.
+	ListChildRuns(ctx context.Context, parentRunID string) ([]*agent.Run, error)
+
 	// Close releases any resources held by the store.
 	Close() error
 }

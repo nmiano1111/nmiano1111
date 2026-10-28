@@ -3,6 +3,7 @@ package sqlite_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -356,6 +357,71 @@ func TestStore_EventParentSeq(t *testing.T) {
 	}
 	if got[2].ParentSeq == nil || *got[2].ParentSeq != 1 {
 		t.Errorf("tool_result ParentSeq = %v, want &1", got[2].ParentSeq)
+	}
+}
+
+func TestStore_ListChildRuns(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	parent := &agent.Run{
+		ID: "p-001", AgentID: "planner", Prompt: "plan the work",
+		Status: agent.RunStatusCompleted, CreatedAt: time.Now(), RunnerName: "fake",
+	}
+	if err := s.CreateRun(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two children, created in ascending time order.
+	base := time.Now()
+	for i, prompt := range []string{"task A", "task B"} {
+		child := &agent.Run{
+			ID:          fmt.Sprintf("child-%03d", i),
+			AgentID:     "worker",
+			Prompt:      prompt,
+			Status:      agent.RunStatusCompleted,
+			CreatedAt:   base.Add(time.Duration(i+1) * time.Second),
+			RunnerName:  "fake",
+			ParentRunID: parent.ID,
+		}
+		if err := s.CreateRun(ctx, child); err != nil {
+			t.Fatalf("CreateRun(%s) = %v", child.ID, err)
+		}
+	}
+
+	// An unrelated run that must not appear in child results.
+	other := &agent.Run{
+		ID: "other-001", AgentID: "a", Prompt: "unrelated",
+		Status: agent.RunStatusCompleted, CreatedAt: time.Now(), RunnerName: "fake",
+	}
+	if err := s.CreateRun(ctx, other); err != nil {
+		t.Fatal(err)
+	}
+
+	children, err := s.ListChildRuns(ctx, parent.ID)
+	if err != nil {
+		t.Fatalf("ListChildRuns() error = %v", err)
+	}
+	if len(children) != 2 {
+		t.Fatalf("ListChildRuns() = %d runs, want 2", len(children))
+	}
+	// Ascending order by created_at.
+	if children[0].Prompt != "task A" || children[1].Prompt != "task B" {
+		t.Errorf("unexpected order: %q, %q", children[0].Prompt, children[1].Prompt)
+	}
+	for _, c := range children {
+		if c.ParentRunID != parent.ID {
+			t.Errorf("child ParentRunID = %q, want %q", c.ParentRunID, parent.ID)
+		}
+	}
+
+	// Run with no children returns an empty (non-nil) slice.
+	noKids, err := s.ListChildRuns(ctx, other.ID)
+	if err != nil {
+		t.Fatalf("ListChildRuns(no children) error = %v", err)
+	}
+	if noKids == nil || len(noKids) != 0 {
+		t.Errorf("expected empty slice, got %v", noKids)
 	}
 }
 

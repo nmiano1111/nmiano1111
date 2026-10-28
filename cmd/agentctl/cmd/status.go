@@ -37,6 +37,12 @@ Examples:
 
 			p := ui.NewPrinter(os.Stdout, rootFlags.jsonOut)
 			p.PrintRun(run)
+
+			children, err := st.ListChildRuns(cmd.Context(), runID)
+			if err == nil && len(children) > 0 {
+				p.Println(ui.StyleDim.Render("  Delegated tasks") + "\n")
+				p.PrintRunTable(children)
+			}
 			return nil
 		},
 	}

@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -50,9 +51,17 @@ func (r *Runner) Run(ctx context.Context, req agent.RunRequest) (<-chan agent.Ev
 	if req.Config.WorkDir != "" {
 		cmd.Dir = req.Config.WorkDir
 	}
+	// Start from the full parent environment so PATH, HOME, etc. are inherited,
+	// then layer in any per-request overrides and the nickbot context vars.
+	env := os.Environ()
 	for k, v := range req.Config.Env {
-		cmd.Env = append(cmd.Env, k+"="+v)
+		env = append(env, k+"="+v)
 	}
+	env = append(env, "NICKBOT_RUN_ID="+req.RunID)
+	if req.ParentRunID != "" {
+		env = append(env, "NICKBOT_PARENT_RUN_ID="+req.ParentRunID)
+	}
+	cmd.Env = env
 
 	// Use a buffer for stderr so we can include it in error messages.
 	// This is safe: cmd.Wait() ensures all subprocess I/O has completed

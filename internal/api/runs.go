@@ -53,14 +53,15 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 }
 
 type createRunReq struct {
-	Prompt    string `json:"prompt"`
-	AgentID   string `json:"agent_id"`
-	Model     string `json:"model"`
-	WorkDir   string `json:"workdir"`
-	Runner    string `json:"runner"`
-	TimeoutMS int64  `json:"timeout_ms"`
-	Verify    string `json:"verify"`
-	Isolate   bool   `json:"isolate"`
+	Prompt      string `json:"prompt"`
+	AgentID     string `json:"agent_id"`
+	Model       string `json:"model"`
+	WorkDir     string `json:"workdir"`
+	Runner      string `json:"runner"`
+	TimeoutMS   int64  `json:"timeout_ms"`
+	Verify      string `json:"verify"`
+	Isolate     bool   `json:"isolate"`
+	ParentRunID string `json:"parent_run_id"`
 }
 
 func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
@@ -91,8 +92,9 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 
 	orch := orchestration.New(runner, s.st, s.log)
 	runReq := agent.RunRequest{
-		AgentID: req.AgentID,
-		Prompt:  req.Prompt,
+		AgentID:     req.AgentID,
+		Prompt:      req.Prompt,
+		ParentRunID: req.ParentRunID,
 		Config: agent.RunConfig{
 			Model:           req.Model,
 			WorkDir:         req.WorkDir,
@@ -164,4 +166,24 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
+}
+
+func (s *Server) handleListChildRuns(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, err := s.st.GetRun(r.Context(), id); err != nil {
+		if _, ok := err.(store.ErrNotFound); ok {
+			writeError(w, http.StatusNotFound, "run not found")
+			return
+		}
+		s.log.Error("get run", slog.String("id", id), slog.Any("err", err))
+		writeError(w, http.StatusInternalServerError, "failed to get run")
+		return
+	}
+	runs, err := s.st.ListChildRuns(r.Context(), id)
+	if err != nil {
+		s.log.Error("list child runs", slog.String("parent_id", id), slog.Any("err", err))
+		writeError(w, http.StatusInternalServerError, "failed to list child runs")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"runs": runs})
 }

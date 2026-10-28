@@ -254,6 +254,32 @@ func (s *Store) ListRuns(ctx context.Context, limit int) ([]*agent.Run, error) {
 	return runs, rows.Err()
 }
 
+// ListChildRuns implements store.Store.
+func (s *Store) ListChildRuns(ctx context.Context, parentRunID string) ([]*agent.Run, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, agent_id, prompt, status, runner_name, model,
+		       created_at, started_at, completed_at,
+		       result, error, cost_usd, input_tokens, output_tokens, duration_ms,
+		       parent_run_id, pid
+		FROM runs WHERE parent_run_id=? ORDER BY created_at ASC`, parentRunID)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: list child runs: %w", err)
+	}
+	defer rows.Close()
+	var runs []*agent.Run
+	for rows.Next() {
+		r, err := scanRun(rows)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite: scan run: %w", err)
+		}
+		runs = append(runs, r)
+	}
+	if runs == nil {
+		runs = []*agent.Run{}
+	}
+	return runs, rows.Err()
+}
+
 // ── Event operations ──────────────────────────────────────────────────────────
 
 // AppendEvent implements store.Store.

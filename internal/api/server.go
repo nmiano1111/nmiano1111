@@ -43,6 +43,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/runs", s.handleListRuns)
 	s.mux.HandleFunc("POST /api/v1/runs", s.handleCreateRun)
 	s.mux.HandleFunc("GET /api/v1/runs/{id}", s.handleGetRun)
+	s.mux.HandleFunc("GET /api/v1/runs/{id}/children", s.handleListChildRuns)
 	s.mux.HandleFunc("POST /api/v1/runs/{id}/cancel", s.handleCancelRun)
 
 	// Events

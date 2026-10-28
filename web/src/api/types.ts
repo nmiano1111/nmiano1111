@@ -109,6 +109,7 @@ export interface CreateRunRequest {
   timeout_ms?: number
   verify?: string
   isolate?: boolean
+  parent_run_id?: string
 }
 
 export interface ApiError {

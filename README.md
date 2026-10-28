@@ -259,6 +259,14 @@ agentctl run "prompt"
 
 ---
 
+## 📋 Runbook
+
+Common task patterns with copy-paste examples: test generation, safe refactoring, verified changes, batch scripting, and more.
+
+→ **[docs/runbook.md](docs/runbook.md)**
+
+---
+
 ## 🧪 Development
 
 ```bash
