@@ -55,6 +55,7 @@ func init() {
 		newMCPCmd(),
 		newCancelCmd(),
 		newWebCmd(),
+		newJobCmd(),
 	)
 }
 

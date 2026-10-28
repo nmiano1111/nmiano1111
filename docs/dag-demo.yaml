@@ -1,0 +1,31 @@
+name: "Code review"
+runner: fake
+
+stages:
+  - id: plan
+    prompt: "Analyse the project layout and produce a brief work plan."
+
+  - id: backend
+    depends_on: [plan]
+    prompt: "Review the backend service for issues."
+
+  - id: frontend
+    depends_on: [plan]
+    prompt: "Review the frontend code for issues."
+
+  - id: synthesise
+    depends_on: [backend, frontend]
+    prompt: |
+      Combine these findings into a prioritised action list.
+
+      Backend findings:
+      {{backend.result}}
+
+      Frontend findings:
+      {{frontend.result}}
+
+  - id: verify
+    depends_on: [synthesise]
+    prompt: |
+      Verify this action list is complete and actionable:
+      {{synthesise.result}}
